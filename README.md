@@ -1,16 +1,17 @@
-# OpenCardboard – step 1: head tracking + Cardboard lens view
+# OpenCardboard
 
-1. Push the contents of this folder to the ROOT of a GitHub repo
-   (project.yml must be at the top level, plus .github/ and Sources/).
-2. Actions tab -> "Build IPA" runs automatically -> download the
-   `OpenCardboard-ipa` artifact -> unzip to get OpenCardboard.ipa.
-3. Open the .ipa in Sideloadly, sign with your Apple ID, install.
-   Settings > General > VPN & Device Management: trust your profile.
-4. Run it in landscape (phone top pointing left), put it in the viewer.
-   Tap the screen to recenter. The red pillar is "forward".
+Phone side of the iPhone -> SteamVR headset project.
 
-## Tuning (Sources/Renderer.swift, LensParams)
-k1/k2, screenToLensMM, lensSeparationMM, ipdMM. Values are approximate.
+## Updating the app
+Upload these files to the repo (same names overwrite). You do NOT need to re-upload .github/.
+Wait for the green check in Actions, download the new .ipa, install with Sideloadly
+(same Apple ID, same bundle ID every time so it updates instead of adding a new app).
 
-## If head movement is backwards
-Set `useTranspose = false` in HeadTracker.swift.
+## Using the app
+- Tap: recenter. Long-press (1 s): open/close the settings panel.
+- Settings: IPD, lens separation, screen-to-lens distance, k1, k2; 3 saved presets.
+  The panel also shows the phone's IP address and link status.
+- With no PC connected it shows the test grid room.
+
+## Testing the link before the SteamVR driver exists
+See tools/test_sender.py and PROTOCOL.md.

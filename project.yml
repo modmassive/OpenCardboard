@@ -15,6 +15,7 @@ targets:
         UISupportedInterfaceOrientations: [UIInterfaceOrientationLandscapeRight]
         UIRequiresFullScreen: true
         NSMotionUsageDescription: Used for head tracking.
+        NSLocalNetworkUsageDescription: Used to connect to your PC for VR streaming.
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.example.opencardboard
