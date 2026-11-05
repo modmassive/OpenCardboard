@@ -4,11 +4,11 @@ import simd
 /// Approximate Cardboard v2-style lens settings. Tune these.
 struct LensParams {
     var ipdMM: Float = 64
-    var lensSeparationMM: Float = 64
-    var screenToLensMM: Float = 39
-    var k1: Float = 0.34
-    var k2: Float = 0.55
-    var pxPerMM: Float = 460.0 / 25.4   // iPhone Pro-class panels (~460 ppi)
+    var lensSeparationMM: Float = 60
+    var screenToLensMM: Float = 42
+    var k1: Float = 0.441
+    var k2: Float = 0.156
+    var pxPerMM: Float = 460.0 / 25.4
 }
 
 struct Uniforms {
