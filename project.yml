@@ -1,0 +1,22 @@
+name: OpenCardboard
+options:
+  bundleIdPrefix: com.example
+targets:
+  OpenCardboard:
+    type: application
+    platform: iOS
+    deploymentTarget: "15.0"
+    sources: [Sources]
+    info:
+      path: Info.plist
+      properties:
+        CFBundleDisplayName: OpenCardboard
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations: [UIInterfaceOrientationLandscapeRight]
+        UIRequiresFullScreen: true
+        NSMotionUsageDescription: Used for head tracking.
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.opencardboard
+        SWIFT_VERSION: "5.0"
+        TARGETED_DEVICE_FAMILY: "1"
