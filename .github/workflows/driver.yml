@@ -1,0 +1,28 @@
+name: Build SteamVR driver
+on:
+  push:
+    paths:
+      - 'driver/**'
+      - '.github/workflows/driver.yml'
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Get OpenVR headers
+        run: git clone --depth 1 https://github.com/ValveSoftware/openvr.git openvr
+      - name: Configure
+        run: cmake -S driver -B build -A x64
+      - name: Build
+        run: cmake --build build --config Release
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path package/opencardboard/bin/win64 | Out-Null
+          Copy-Item build/Release/driver_opencardboard.dll package/opencardboard/bin/win64/
+          Copy-Item driver/package/* package/opencardboard/ -Recurse
+      - uses: actions/upload-artifact@v4
+        with:
+          name: opencardboard-steamvr-driver
+          path: package
