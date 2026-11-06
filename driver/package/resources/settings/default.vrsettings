@@ -1,0 +1,19 @@
+{
+  "driver_opencardboard": {
+    "serialNumber": "OPENCARDBOARD-001",
+    "modelNumber": "OpenCardboard",
+    "phoneAddress": "172.20.10.1",
+    "phonePort": 9000,
+    "windowX": 100,
+    "windowY": 100,
+    "windowWidth": 1280,
+    "windowHeight": 640,
+    "renderWidth": 640,
+    "renderHeight": 640,
+    "displayFrequency": 60.0,
+    "ipd": 0.064,
+    "secondsFromVsyncToPhotons": 0.011,
+    "headHeight": 1.6,
+    "fovTan": 1.2
+  }
+}
