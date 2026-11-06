@@ -12,6 +12,8 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <csignal>
+#include <exception>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
@@ -20,10 +22,18 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <algorithm>
+#include <map>
+#include <d3d11.h>
+#include <dxgi.h>
+#include <wrl/client.h>
 
 #pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "d3d11.lib")
+#pragma comment(lib, "dxgi.lib")
 
 using namespace vr;
+using Microsoft::WRL::ComPtr;
 
 namespace {
 
@@ -31,16 +41,113 @@ const char* kSection = "driver_opencardboard";
 
 // ---------------------------------------------------------------- logging / settings
 
+// File log: %LOCALAPPDATA%\opencardboard-driver.log  (flushed on every line, so it survives crashes)
+SRWLOCK g_logLock = SRWLOCK_INIT;
+char g_logPath[MAX_PATH] = {0};
+bool g_logPathReady = false;
+std::atomic<bool> g_initDone{false};
+
+void FileLog(const char* fmt, ...) {
+    char msg[900];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(msg, sizeof(msg), fmt, args);
+    va_end(args);
+    SYSTEMTIME t;
+    GetLocalTime(&t);
+    AcquireSRWLockExclusive(&g_logLock);
+    if (!g_logPathReady) {
+        char base[MAX_PATH];
+        DWORD n = GetEnvironmentVariableA("LOCALAPPDATA", base, MAX_PATH);
+        if (n > 0 && n < MAX_PATH) snprintf(g_logPath, MAX_PATH, "%s\\opencardboard-driver.log", base);
+        else snprintf(g_logPath, MAX_PATH, "opencardboard-driver.log");
+        g_logPathReady = true;
+    }
+    FILE* f = fopen(g_logPath, "a");
+    if (f) {
+        fprintf(f, "%02d:%02d:%02d.%03d [pid %lu tid %lu] %s\n", t.wHour, t.wMinute, t.wSecond,
+                t.wMilliseconds, GetCurrentProcessId(), GetCurrentThreadId(), msg);
+        fflush(f);
+        fclose(f);
+    }
+    ReleaseSRWLockExclusive(&g_logLock);
+}
+
 void Log(const char* fmt, ...) {
     char buf[1024];
     va_list args;
     va_start(args, fmt);
     vsnprintf(buf, sizeof(buf) - 2, fmt, args);
     va_end(args);
-    size_t n = strlen(buf);
-    buf[n] = '\n';
-    buf[n + 1] = 0;
-    if (IVRDriverLog* l = VRDriverLog()) l->Log(buf);
+    FileLog("%s", buf);
+    if (g_initDone) {
+        size_t n = strlen(buf);
+        buf[n] = '\n';
+        buf[n + 1] = 0;
+        if (IVRDriverLog* l = VRDriverLog()) l->Log(buf);
+    }
+}
+
+// ---- crash diagnostics: record which module is on the stack when something aborts
+
+void LogBacktrace() {
+    void* frames[24];
+    USHORT n = CaptureStackBackTrace(0, 24, frames, nullptr);
+    for (USHORT i = 0; i < n; i++) {
+        HMODULE mod = nullptr;
+        char name[MAX_PATH] = "?";
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               (LPCSTR)frames[i], &mod) && mod) {
+            GetModuleFileNameA(mod, name, MAX_PATH);
+        }
+        const char* base = strrchr(name, '\\');
+        base = base ? base + 1 : name;
+        FileLog("  frame %u: %s+0x%llX", (unsigned)i, base,
+                (unsigned long long)((uintptr_t)frames[i] - (uintptr_t)mod));
+    }
+}
+
+LPTOP_LEVEL_EXCEPTION_FILTER g_prevFilter = nullptr;
+std::terminate_handler g_prevTerminate = nullptr;
+void (*g_prevAbort)(int) = nullptr;
+
+LONG WINAPI CrashFilter(EXCEPTION_POINTERS* ep) {
+    if (ep && ep->ExceptionRecord) {
+        HMODULE mod = nullptr;
+        char name[MAX_PATH] = "?";
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               (LPCSTR)ep->ExceptionRecord->ExceptionAddress, &mod) && mod) {
+            GetModuleFileNameA(mod, name, MAX_PATH);
+        }
+        FileLog("UNHANDLED EXCEPTION code=0x%08lX at %p in %s",
+                ep->ExceptionRecord->ExceptionCode, ep->ExceptionRecord->ExceptionAddress, name);
+        LogBacktrace();
+    }
+    return g_prevFilter ? g_prevFilter(ep) : EXCEPTION_CONTINUE_SEARCH;
+}
+
+void TerminateHandler() {
+    FileLog("std::terminate called (uncaught exception, or a thread destroyed while running)");
+    LogBacktrace();
+    if (g_prevTerminate) g_prevTerminate();
+    abort();
+}
+
+void AbortHandler(int sig) {
+    FileLog("SIGABRT: abort() was called");
+    LogBacktrace();
+    if (g_prevAbort && g_prevAbort != SIG_DFL && g_prevAbort != SIG_IGN) g_prevAbort(sig);
+}
+
+void InstallCrashHandlers() {
+    static bool done = false;
+    if (done) return;
+    done = true;
+    g_prevFilter = SetUnhandledExceptionFilter(CrashFilter);
+    g_prevTerminate = std::set_terminate(TerminateHandler);
+    g_prevAbort = signal(SIGABRT, AbortHandler);
 }
 
 float SettingF(const char* key, float def) {
@@ -104,7 +211,8 @@ HmdQuaternion_t QuatFromMatrix(const float m[3][3]) {
 
 // ---------------------------------------------------------------- the headset
 
-class HmdDevice : public ITrackedDeviceServerDriver, public IVRDisplayComponent {
+class HmdDevice : public ITrackedDeviceServerDriver, public IVRDisplayComponent,
+                  public IVRDriverDirectModeComponent {
 public:
     HmdDevice() {
         serial_ = SettingS("serialNumber", "OPENCARDBOARD-001");
@@ -140,14 +248,28 @@ public:
         VRProperties()->SetFloatProperty(c, Prop_DisplayFrequency_Float, freq_);
         VRProperties()->SetFloatProperty(c, Prop_SecondsFromVsyncToPhotons_Float, photons_);
         VRProperties()->SetUint64Property(c, Prop_CurrentUniverseId_Uint64, 2);
+        if (InitD3D()) {
+            VRProperties()->SetUint64Property(c, Prop_GraphicsAdapterLuid_Uint64,
+                ((uint64_t)luid_.HighPart << 32) | (uint64_t)luid_.LowPart);
+        } else {
+            Log("D3D11 init FAILED - direct mode will not work");
+        }
+        VRProperties()->SetBoolProperty(c, Prop_DriverDirectModeSendsVsyncEvents_Bool, true);
+        if (!vsyncThread_.joinable()) {
+            stopVsync_ = false;
+            vsyncThread_ = std::thread([this] { VsyncLoop(); });
+        }
         Log("OpenCardboard HMD activated (object id %u)", objectId);
         return VRInitError_None;
     }
-    void Deactivate() { objectId_ = k_unTrackedDeviceIndexInvalid; }
+    void Deactivate() { Log("HMD deactivated"); objectId_ = k_unTrackedDeviceIndexInvalid; }
     void EnterStandby() {}
     void* GetComponent(const char* name) {
-        if (_stricmp(name, IVRDisplayComponent_Version) == 0)
+        Log("GetComponent(%s)", name ? name : "(null)");
+        if (name && _stricmp(name, IVRDisplayComponent_Version) == 0)
             return static_cast<IVRDisplayComponent*>(this);
+        if (name && _stricmp(name, IVRDriverDirectModeComponent_Version) == 0)
+            return static_cast<IVRDriverDirectModeComponent*>(this);
         return nullptr;
     }
     void DebugRequest(const char*, char* response, uint32_t size) {
@@ -159,7 +281,7 @@ public:
     void GetWindowBounds(int32_t* x, int32_t* y, uint32_t* w, uint32_t* h) {
         *x = winX_; *y = winY_; *w = (uint32_t)winW_; *h = (uint32_t)winH_;
     }
-    bool IsDisplayOnDesktop() { return true; }
+    bool IsDisplayOnDesktop() { return false; }
     bool IsDisplayRealDisplay() { return false; }
     void GetRecommendedRenderTargetSize(uint32_t* w, uint32_t* h) {
         *w = (uint32_t)renderW_; *h = (uint32_t)renderH_;
@@ -215,6 +337,121 @@ public:
             VRServerDriverHost()->TrackedDevicePoseUpdated(id, BuildPose(), sizeof(DriverPose_t));
     }
 
+    // ---------------------------------------------------------- D3D11 + direct mode
+    bool InitD3D() {
+        ComPtr<IDXGIFactory1> factory;
+        if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return false;
+        ComPtr<IDXGIAdapter1> best;
+        SIZE_T bestMem = 0;
+        for (UINT i = 0;; i++) {
+            ComPtr<IDXGIAdapter1> a;
+            if (factory->EnumAdapters1(i, &a) == DXGI_ERROR_NOT_FOUND) break;
+            DXGI_ADAPTER_DESC1 d;
+            a->GetDesc1(&d);
+            if (d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) continue;
+            if (d.DedicatedVideoMemory >= bestMem) { bestMem = d.DedicatedVideoMemory; best = a; }
+        }
+        if (!best) return false;
+        DXGI_ADAPTER_DESC1 d;
+        best->GetDesc1(&d);
+        luid_ = d.AdapterLuid;
+        char name[256] = {0};
+        WideCharToMultiByte(CP_UTF8, 0, d.Description, -1, name, sizeof(name) - 1, nullptr, nullptr);
+        Log("using GPU: %s (%llu MB)", name, (unsigned long long)(d.DedicatedVideoMemory >> 20));
+        D3D_FEATURE_LEVEL fl;
+        HRESULT hr = D3D11CreateDevice(best.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr,
+                                       D3D11_CREATE_DEVICE_BGRA_SUPPORT, nullptr, 0,
+                                       D3D11_SDK_VERSION, &dev_, &fl, &ctx_);
+        if (FAILED(hr)) { Log("D3D11CreateDevice failed: 0x%08lX", (unsigned long)hr); return false; }
+        return true;
+    }
+
+    void VsyncLoop() {
+        using clock = std::chrono::steady_clock;
+        double hz = std::max(freq_, 1.0f);
+        auto period = std::chrono::duration_cast<clock::duration>(std::chrono::duration<double>(1.0 / hz));
+        auto next = clock::now();
+        while (!stopVsync_) {
+            VRServerDriverHost()->VsyncEvent(0.0);
+            next += period;
+            std::this_thread::sleep_until(next);
+        }
+    }
+
+    void Shutdown() {
+        stopVsync_ = true;
+        if (vsyncThread_.joinable()) vsyncThread_.join();
+    }
+
+    // IVRDriverDirectModeComponent
+    void CreateSwapTextureSet(uint32_t pid, const SwapTextureSetDesc_t* desc, SwapTextureSet_t* out) {
+        Log("CreateSwapTextureSet pid=%u %ux%u format=%u samples=%u", pid, desc->nWidth, desc->nHeight,
+            desc->nFormat, desc->nSampleCount);
+        std::lock_guard<std::mutex> g(d3dMu_);
+        D3D11_TEXTURE2D_DESC td = {};
+        td.Width = desc->nWidth;
+        td.Height = desc->nHeight;
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.Format = (DXGI_FORMAT)desc->nFormat;
+        td.SampleDesc.Count = desc->nSampleCount;
+        td.SampleDesc.Quality = 0;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+        td.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
+        out->unTextureFlags = 0;
+        for (int i = 0; i < 3; i++) {
+            out->rSharedTextureHandles[i] = 0;
+            if (!dev_) continue;
+            ComPtr<ID3D11Texture2D> t;
+            HRESULT hr = dev_->CreateTexture2D(&td, nullptr, &t);
+            if (FAILED(hr)) { Log("CreateTexture2D failed: 0x%08lX", (unsigned long)hr); continue; }
+            ComPtr<IDXGIResource> r;
+            t.As(&r);
+            HANDLE h = nullptr;
+            if (r) r->GetSharedHandle(&h);
+            out->rSharedTextureHandles[i] = (SharedTextureHandle_t)(uintptr_t)h;
+            SwapTex st;
+            st.tex = t;
+            st.pid = pid;
+            swap_[(uint64_t)(uintptr_t)h] = st;
+        }
+    }
+    void DestroySwapTextureSet(SharedTextureHandle_t h) {
+        std::lock_guard<std::mutex> g(d3dMu_);
+        swap_.erase((uint64_t)h);
+    }
+    void DestroyAllSwapTextureSets(uint32_t pid) {
+        std::lock_guard<std::mutex> g(d3dMu_);
+        for (auto it = swap_.begin(); it != swap_.end();) {
+            if (it->second.pid == pid) it = swap_.erase(it); else ++it;
+        }
+    }
+    void GetNextSwapTextureSetIndex(SharedTextureHandle_t sharedTextureHandles[2], uint32_t (*pIndices)[2]) {
+        for (int i = 0; i < 2; i++) {
+            nextIdx_[i] = (nextIdx_[i] + 1) % 3;
+            (*pIndices)[i] = nextIdx_[i];
+        }
+    }
+    void SubmitLayer(const SubmitLayerPerEye_t (&perEye)[2]) {
+        lastLayer_[0] = perEye[0].hTexture;
+        lastLayer_[1] = perEye[1].hTexture;
+    }
+    void Present(SharedTextureHandle_t syncTexture) {
+        uint64_t n = ++presented_;
+        if (n == 1 || n % 300 == 0) {
+            Log("direct mode: %llu frames presented", (unsigned long long)n);
+        }
+        std::lock_guard<std::mutex> g(d3dMu_);
+        ComPtr<IDXGIKeyedMutex> km = SyncMutex(syncTexture);
+        if (km && SUCCEEDED(km->AcquireSync(0, 10))) {
+            // stage 2b: copy both eyes into one frame here, encode it, send it to the phone
+            km->ReleaseSync(0);
+        }
+    }
+    void PostPresent(const Throttling_t*) {}
+    void GetFrameTiming(DriverDirectMode_FrameTiming*) {}
+
 private:
     DriverPose_t BuildPose() {
         DriverPose_t p = {};
@@ -244,6 +481,31 @@ private:
     bool connected_ = false;
     HmdQuaternion_t q_;
     float pos_[3] = {0, 0, 0};
+
+    ComPtr<IDXGIKeyedMutex> SyncMutex(SharedTextureHandle_t h) {
+        auto it = syncCache_.find((uint64_t)h);
+        if (it != syncCache_.end()) return it->second;
+        ComPtr<IDXGIKeyedMutex> km;
+        if (dev_ && h) {
+            ComPtr<ID3D11Texture2D> t;
+            if (SUCCEEDED(dev_->OpenSharedResource((HANDLE)(uintptr_t)h, IID_PPV_ARGS(&t)))) t.As(&km);
+        }
+        syncCache_[(uint64_t)h] = km;     // cached even when null, so the handle is only opened once
+        return km;
+    }
+
+    struct SwapTex { ComPtr<ID3D11Texture2D> tex; uint32_t pid = 0; };
+    ComPtr<ID3D11Device> dev_;
+    ComPtr<ID3D11DeviceContext> ctx_;
+    LUID luid_ = {};
+    std::map<uint64_t, SwapTex> swap_;
+    std::map<uint64_t, ComPtr<IDXGIKeyedMutex>> syncCache_;
+    std::mutex d3dMu_;
+    uint32_t nextIdx_[2] = {0, 0};
+    SharedTextureHandle_t lastLayer_[2] = {0, 0};
+    std::atomic<uint64_t> presented_{0};
+    std::thread vsyncThread_;
+    std::atomic<bool> stopVsync_{false};
 };
 
 // ---------------------------------------------------------------- network client
@@ -252,7 +514,17 @@ class NetClient {
 public:
     void Start(const std::string& host, uint16_t port, HmdDevice* hmd) {
         host_ = host; port_ = port; hmd_ = hmd; stop_ = false;
-        thread_ = std::thread([this] { Run(); });
+        thread_ = std::thread([this] {
+            FileLog("network thread started");
+            try {
+                Run();
+            } catch (const std::exception& e) {
+                FileLog("network thread: exception: %s", e.what());
+            } catch (...) {
+                FileLog("network thread: unknown exception");
+            }
+            FileLog("network thread ended");
+        });
     }
     void Stop() {
         stop_ = true;
@@ -262,7 +534,7 @@ public:
     }
 
 private:
-    void Sleep(int ms) {
+    void SleepMs(int ms) {
         for (int i = 0; i < ms / 50 && !stop_; i++) std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
 
@@ -359,7 +631,7 @@ private:
         Log("looking for the phone at %s:%u", host_.c_str(), (unsigned)port_);
         while (!stop_) {
             SOCKET s = Connect();
-            if (s == INVALID_SOCKET) { Sleep(1000); continue; }
+            if (s == INVALID_SOCKET) { SleepMs(1000); continue; }
             sock_ = s;
             Log("connected to the phone");
             hmd_->SetConnected(true);
@@ -368,7 +640,7 @@ private:
             closesocket(s);
             hmd_->SetConnected(false);
             Log("disconnected from the phone");
-            Sleep(500);
+            SleepMs(500);
         }
         WSACleanup();
     }
@@ -387,19 +659,26 @@ private:
 class Provider : public IServerTrackedDeviceProvider {
 public:
     EVRInitError Init(IVRDriverContext* ctx) {
+        FileLog("Provider::Init begin");
         VR_INIT_SERVER_DRIVER_CONTEXT(ctx);
-        Log("OpenCardboard driver starting");
+        g_initDone = true;
+        Log("driver context ready");
         hmd_ = new HmdDevice();
-        VRServerDriverHost()->TrackedDeviceAdded(hmd_->Serial().c_str(), TrackedDeviceClass_HMD, hmd_);
+        Log("HMD object created");
+        bool added = VRServerDriverHost()->TrackedDeviceAdded(hmd_->Serial().c_str(), TrackedDeviceClass_HMD, hmd_);
+        Log("TrackedDeviceAdded returned %d", added ? 1 : 0);
         std::string host = SettingS("phoneAddress", "172.20.10.1");
         int port = SettingI("phonePort", 9000);
         net_.Start(host, (uint16_t)port, hmd_);
+        Log("Provider::Init done");
         return VRInitError_None;
     }
     void Cleanup() {
+        Log("Provider::Cleanup begin");
+        if (hmd_) hmd_->Shutdown();
         net_.Stop();
-        delete hmd_;
-        hmd_ = nullptr;
+        hmd_ = nullptr;     // intentionally not deleted: SteamVR may still hold the pointer
+        Log("Provider::Cleanup done");
     }
     const char* const* GetInterfaceVersions() { return k_InterfaceVersions; }
     void RunFrame() {
@@ -425,14 +704,26 @@ public:
     void Cleanup() {}
 };
 
-Provider g_provider;
-Watchdog g_watchdog;
+// Heap-allocated and never destroyed, so nothing runs during process/DLL teardown.
+Provider* g_provider = nullptr;
+Watchdog* g_watchdog = nullptr;
 
 }  // namespace
 
 extern "C" __declspec(dllexport) void* HmdDriverFactory(const char* name, int* returnCode) {
-    if (strcmp(name, IServerTrackedDeviceProvider_Version) == 0) return &g_provider;
-    if (strcmp(name, IVRWatchdogProvider_Version) == 0) return &g_watchdog;
+    InstallCrashHandlers();
+    char exe[MAX_PATH] = "?";
+    GetModuleFileNameA(nullptr, exe, MAX_PATH);
+    FileLog("HmdDriverFactory(\"%s\") called inside %s", name ? name : "(null)", exe);
+    if (name && strcmp(name, IServerTrackedDeviceProvider_Version) == 0) {
+        if (!g_provider) g_provider = new Provider();
+        return g_provider;
+    }
+    if (name && strcmp(name, IVRWatchdogProvider_Version) == 0) {
+        if (!g_watchdog) g_watchdog = new Watchdog();
+        return g_watchdog;
+    }
+    FileLog("HmdDriverFactory: unknown interface");
     if (returnCode) *returnCode = VRInitError_Init_InterfaceNotFound;
     return nullptr;
 }
