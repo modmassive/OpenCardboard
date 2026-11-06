@@ -14,7 +14,7 @@ struct Uniforms {
     var frustL: SIMD4<Float>
     var frustR: SIMD4<Float>
     var mode: Float
-    var pad0: Float = 0
+    var hud: Float
     var pad1: Float = 0
     var pad2: Float = 0
 }
@@ -53,6 +53,7 @@ final class Renderer: NSObject, MTKViewDelegate {
     private let queue: MTLCommandQueue
     private let pipeline: MTLRenderPipelineState
     private let dummy: MTLTexture
+    private let hudTexture: MTLTexture
     private var textureCache: CVMetalTextureCache?
     private let tracker = HeadTracker()
     private let decoder = VideoDecoder()
@@ -61,6 +62,7 @@ final class Renderer: NSObject, MTKViewDelegate {
     let pxPerMM: Float = 460.0 / 25.4   // iPhone Pro-class panels (~460 ppi)
     var lens = LensSettings()
     var forceTest = false
+    var hudManual = false               // toggled by double-tap
 
     private var poseSeq: UInt32 = 0
     private let lock = NSLock()
@@ -72,15 +74,27 @@ final class Renderer: NSObject, MTKViewDelegate {
     private var lastFPS = 0.0
     private var showingVideo = false
 
+    // headset status display
+    private var hudAutoUntil = CACurrentMediaTime() + 10
+    private var lastHUDUpdate = 0.0
+    private var lastConnected = false
+    private var hudLastCount = 0
+    private var hudLastTime = CACurrentMediaTime()
+    private var hudFPS = 0.0
+
     init?(view: MTKView) {
         guard let dev = MTLCreateSystemDefaultDevice(),
               let q = dev.makeCommandQueue() else { return nil }
         let td = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm,
                                                           width: 1, height: 1, mipmapped: false)
-        guard let dummyTex = dev.makeTexture(descriptor: td) else { return nil }
+        let hd = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm,
+                                                          width: 1024, height: 512, mipmapped: false)
+        guard let dummyTex = dev.makeTexture(descriptor: td),
+              let hudTex = dev.makeTexture(descriptor: hd) else { return nil }
         device = dev
         queue = q
         dummy = dummyTex
+        hudTexture = hudTex
         var cache: CVMetalTextureCache?
         CVMetalTextureCacheCreate(nil, nil, dev, nil, &cache)
         textureCache = cache
@@ -139,6 +153,8 @@ final class Renderer: NSObject, MTKViewDelegate {
                      lens: lens, frustL: fl, frustR: fr)
     }
 
+    // MARK: status text (settings panel)
+
     func statusText() -> String {
         let now = CACurrentMediaTime()
         lock.lock()
@@ -164,6 +180,78 @@ final class Renderer: NSObject, MTKViewDelegate {
         return s
     }
 
+    // MARK: in-headset status display
+
+    private func primaryIP() -> String {
+        let all = localIPv4Addresses()
+        func addr(_ s: String) -> String { s.split(separator: " ").last.map(String.init) ?? s }
+        if let b = all.first(where: { $0.hasPrefix("bridge") }) { return "USB " + addr(b) }
+        if let w = all.first(where: { $0.hasPrefix("en0") }) { return "WiFi " + addr(w) }
+        return "IP: none"
+    }
+
+    private func hudLines() -> [String] {
+        let now = CACurrentMediaTime()
+        lock.lock()
+        let count = decodedCount
+        let cfg = streamCfg
+        lock.unlock()
+        if now - hudLastTime >= 0.4 {
+            hudFPS = Double(count - hudLastCount) / (now - hudLastTime)
+            hudLastCount = count
+            hudLastTime = now
+        }
+        let connected = link.isConnected
+        var l: [String] = []
+        l.append(connected ? "PC: connected" : "PC: waiting")
+        l.append(connected ? String(format: "Ping: %.1f ms", link.rttMs) : "Ping: -")
+        if let c = cfg {
+            l.append("Stream: \(c.width)x\(c.height) \(c.codec == 2 ? "HEVC" : "H264")")
+        } else {
+            l.append("Stream: none")
+        }
+        l.append(String(format: "Decode: %.0f fps", hudFPS))
+        l.append("View: " + (showingVideo ? "video" : "test scene"))
+        l.append(primaryIP())
+        if !connected, !link.lastCloseReason.isEmpty {
+            l.append("Drop: " + String(link.lastCloseReason.prefix(24)))
+        }
+        return l
+    }
+
+    private func renderHUD(lines: [String]) {
+        let fmt = UIGraphicsImageRendererFormat()
+        fmt.scale = 1
+        fmt.opaque = false
+        let size = CGSize(width: 1024, height: 512)
+        let img = UIGraphicsImageRenderer(size: size, format: fmt).image { _ in
+            UIColor(white: 0, alpha: 0.78).setFill()
+            UIBezierPath(roundedRect: CGRect(origin: .zero, size: size), cornerRadius: 40).fill()
+            let para = NSMutableParagraphStyle()
+            para.alignment = .center
+            let attrs: [NSAttributedString.Key: Any] = [
+                .font: UIFont.monospacedSystemFont(ofSize: 48, weight: .bold),
+                .foregroundColor: UIColor.white,
+                .paragraphStyle: para
+            ]
+            (lines.joined(separator: "\n") as NSString)
+                .draw(in: CGRect(x: 20, y: 24, width: 984, height: 470), withAttributes: attrs)
+        }
+        guard let cg = img.cgImage else { return }
+        var pixels = [UInt8](repeating: 0, count: 1024 * 512 * 4)
+        pixels.withUnsafeMutableBytes { raw in
+            guard let ctx = CGContext(data: raw.baseAddress, width: 1024, height: 512,
+                                      bitsPerComponent: 8, bytesPerRow: 1024 * 4,
+                                      space: CGColorSpaceCreateDeviceRGB(),
+                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return }
+            ctx.draw(cg, in: CGRect(x: 0, y: 0, width: 1024, height: 512))
+        }
+        hudTexture.replace(region: MTLRegionMake2D(0, 0, 1024, 512), mipmapLevel: 0,
+                           withBytes: pixels, bytesPerRow: 1024 * 4)
+    }
+
+    // MARK: drawing
+
     private func makeTexture(_ pb: CVPixelBuffer) -> (MTLTexture, CVMetalTexture)? {
         guard let cache = textureCache else { return nil }
         var cv: CVMetalTexture?
@@ -181,10 +269,21 @@ final class Renderer: NSObject, MTKViewDelegate {
               let enc = cb.makeRenderCommandEncoder(descriptor: pass) else { return }
         let size = view.drawableSize
         let R = tracker.viewMatrix()
+        let now = CACurrentMediaTime()
 
-        if link.isConnected {
+        let connected = link.isConnected
+        if connected {
             poseSeq &+= 1
             link.sendPose(seq: poseSeq, time: ProcessInfo.processInfo.systemUptime, rotation: R)
+        }
+        if connected != lastConnected {
+            lastConnected = connected
+            hudAutoUntil = now + 6          // show status for a few seconds when the link changes
+        }
+        let hudOn = hudManual || now < hudAutoUntil
+        if hudOn && now - lastHUDUpdate > 0.3 {
+            lastHUDUpdate = now
+            renderHUD(lines: hudLines())
         }
 
         lock.lock()
@@ -200,7 +299,7 @@ final class Renderer: NSObject, MTKViewDelegate {
         var cvHold: CVMetalTexture?
 
         if !forceTest, let f = frame, let c = cfg,
-           CACurrentMediaTime() - f.arrival < 1.0,
+           now - f.arrival < 1.0,
            let (t, cv) = makeTexture(f.pixelBuffer) {
             mode = 1
             // rotate view rays from "head now" into "head at render time"
@@ -219,10 +318,11 @@ final class Renderer: NSObject, MTKViewDelegate {
                          k1: lens.k1, k2: lens.k2,
                          pxPerMM: pxPerMM,
                          lensSepMM: lens.lensSeparationMM,
-                         frustL: fL, frustR: fR, mode: mode)
+                         frustL: fL, frustR: fR, mode: mode, hud: hudOn ? 1 : 0)
         enc.setRenderPipelineState(pipeline)
         enc.setFragmentBytes(&u, length: MemoryLayout<Uniforms>.stride, index: 0)
         enc.setFragmentTexture(tex, index: 0)
+        enc.setFragmentTexture(hudTexture, index: 1)
         enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
         enc.endEncoding()
 
@@ -254,7 +354,7 @@ struct Uniforms {
     float4 frustL;
     float4 frustR;
     float mode;
-    float pad0;
+    float hud;
     float pad1;
     float pad2;
 };
@@ -277,7 +377,8 @@ float gridLine(float2 p, float scale) {
 
 fragment float4 fs(VOut in [[stage_in]],
                    constant Uniforms& u [[buffer(0)]],
-                   texture2d<float> tex [[texture(0)]]) {
+                   texture2d<float> tex [[texture(0)]],
+                   texture2d<float> hudTex [[texture(1)]]) {
     constexpr sampler smp(filter::linear, address::clamp_to_edge);
 
     float2 frag = in.pos.xy;
@@ -293,53 +394,67 @@ fragment float4 fs(VOut in [[stage_in]],
     float2 tu = t * (1.0 + u.k1 * r2 + u.k2 * r2 * r2);
     float vig = smoothstep(1.4, 1.0, length(t));
 
+    float3 col = float3(0.0);
+
     if (u.mode > 0.5) {
         // video: rotational timewarp, then project into the rendered frame
         float3 d = u.warp * normalize(float3(tu.x, tu.y, -1.0));
-        if (d.z > -1e-3) { return float4(0.0, 0.0, 0.0, 1.0); }
-        float tx = d.x / -d.z;
-        float ty = d.y / -d.z;
-        float4 fr = left ? u.frustL : u.frustR;   // left, right, up, down
-        float uu = (tx + fr.x) / (fr.x + fr.y);
-        float vv = (fr.z - ty) / (fr.z + fr.w);
-        if (uu < 0.0 || uu > 1.0 || vv < 0.0 || vv > 1.0) {
-            return float4(0.0, 0.0, 0.0, 1.0);
+        if (d.z < -1e-3) {
+            float tx = d.x / -d.z;
+            float ty = d.y / -d.z;
+            float4 fr = left ? u.frustL : u.frustR;   // left, right, up, down
+            float uu = (tx + fr.x) / (fr.x + fr.y);
+            float vv = (fr.z - ty) / (fr.z + fr.w);
+            if (uu >= 0.0 && uu <= 1.0 && vv >= 0.0 && vv <= 1.0) {
+                float2 uv = float2((left ? 0.0 : 0.5) + uu * 0.5, vv);
+                col = tex.sample(smp, uv, level(0)).rgb;
+            }
         }
-        float2 uv = float2((left ? 0.0 : 0.5) + uu * 0.5, vv);
-        float3 c = tex.sample(smp, uv).rgb;
-        return float4(c * vig, 1.0);
+    } else {
+        float3 rd = normalize(u.view * float3(tu.x, tu.y, -1.0));
+        float3 ro = u.view * float3(eye * u.ipd * 0.5, 0.0, 0.0);
+
+        float h = clamp(rd.y * 0.5 + 0.5, 0.0, 1.0);
+        col = mix(float3(0.05, 0.07, 0.12), float3(0.01, 0.01, 0.04), h);
+
+        if (rd.y < -1e-3) {
+            float tt = (-1.6 - ro.y) / rd.y;
+            float3 p = ro + rd * tt;
+            float g1 = gridLine(p.xz, 1.0);
+            float g5 = gridLine(p.xz, 5.0);
+            float3 fl = float3(0.04, 0.06, 0.09) + float3(0.15, 0.55, 0.9) * g1 * 0.6
+                      + float3(1.0, 0.6, 0.2) * g5 * 0.8;
+            col = mix(col, fl, exp(-tt * 0.06));
+        } else if (rd.y > 1e-3) {
+            float tt = (2.4 - ro.y) / rd.y;
+            float3 p = ro + rd * tt;
+            float g1 = gridLine(p.xz, 1.0);
+            float3 cl = float3(0.03, 0.04, 0.07) + float3(0.3, 0.2, 0.6) * g1 * 0.5;
+            col = mix(col, cl, exp(-tt * 0.08));
+        }
+
+        float az = atan2(rd.x, -rd.z);
+        float step45 = M_PI_F / 4.0;
+        float k = round(az / step45);
+        if (abs(az - k * step45) < 0.012 && abs(rd.y) < 0.4) {
+            float3 pc = (k == 0.0) ? float3(1.0, 0.2, 0.2) : float3(0.9);
+            col = mix(col, pc, 0.9);
+        }
     }
 
-    float3 rd = normalize(u.view * float3(tu.x, tu.y, -1.0));
-    float3 ro = u.view * float3(eye * u.ipd * 0.5, 0.0, 0.0);
+    col *= vig;
 
-    float h = clamp(rd.y * 0.5 + 0.5, 0.0, 1.0);
-    float3 col = mix(float3(0.05, 0.07, 0.12), float3(0.01, 0.01, 0.04), h);
-
-    if (rd.y < -1e-3) {
-        float tt = (-1.6 - ro.y) / rd.y;
-        float3 p = ro + rd * tt;
-        float g1 = gridLine(p.xz, 1.0);
-        float g5 = gridLine(p.xz, 5.0);
-        float3 fl = float3(0.04, 0.06, 0.09) + float3(0.15, 0.55, 0.9) * g1 * 0.6
-                  + float3(1.0, 0.6, 0.2) * g5 * 0.8;
-        col = mix(col, fl, exp(-tt * 0.06));
-    } else if (rd.y > 1e-3) {
-        float tt = (2.4 - ro.y) / rd.y;
-        float3 p = ro + rd * tt;
-        float g1 = gridLine(p.xz, 1.0);
-        float3 cl = float3(0.03, 0.04, 0.07) + float3(0.3, 0.2, 0.6) * g1 * 0.5;
-        col = mix(col, cl, exp(-tt * 0.08));
+    // head-locked status panel, centered in each eye, floating about 1.5 m away
+    if (u.hud > 0.5) {
+        float2 hc = float2(-eye * 0.032 / 1.5, 0.0);
+        float2 hp = (tu - hc) / float2(0.6, 0.3);
+        if (abs(hp.x) <= 1.0 && abs(hp.y) <= 1.0) {
+            float2 huv = float2(hp.x * 0.5 + 0.5, 0.5 - hp.y * 0.5);
+            float4 h = hudTex.sample(smp, huv, level(0));
+            col = h.rgb + col * (1.0 - h.a);
+        }
     }
 
-    float az = atan2(rd.x, -rd.z);
-    float step45 = M_PI_F / 4.0;
-    float k = round(az / step45);
-    if (abs(az - k * step45) < 0.012 && abs(rd.y) < 0.4) {
-        float3 pc = (k == 0.0) ? float3(1.0, 0.2, 0.2) : float3(0.9);
-        col = mix(col, pc, 0.9);
-    }
-
-    return float4(col * vig, 1.0);
+    return float4(col, 1.0);
 }
 """

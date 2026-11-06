@@ -2,16 +2,13 @@
 
 Phone side of the iPhone -> SteamVR headset project.
 
-## Updating the app
-Upload these files to the repo (same names overwrite). You do NOT need to re-upload .github/.
-Wait for the green check in Actions, download the new .ipa, install with Sideloadly
-(same Apple ID, same bundle ID every time so it updates instead of adding a new app).
-
 ## Using the app
-- Tap: recenter. Long-press (1 s): open/close the settings panel.
-- Settings: IPD, lens separation, screen-to-lens distance, k1, k2; 3 saved presets.
-  The panel also shows the phone's IP address and link status.
+- Tap: recenter.
+- Double-tap: show/hide the big status display (centered in each eye, readable in the headset).
+  It also appears by itself for a few seconds at launch and whenever the PC connects or disconnects.
+- Long-press (1 s): open/close the settings panel (lens settings, 3 presets, status).
 - With no PC connected it shows the test grid room.
 
-## Testing the link before the SteamVR driver exists
-See tools/test_sender.py and PROTOCOL.md.
+## Testing without the SteamVR driver
+See tools/test_sender.py and PROTOCOL.md. Over USB: turn on Personal Hotspot ("Allow Others to Join"),
+plug in the cable, and connect to the phone's address shown on the status display (often 172.20.10.1).

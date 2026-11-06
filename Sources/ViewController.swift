@@ -38,14 +38,26 @@ final class ViewController: UIViewController, UIGestureRecognizerDelegate {
 
         let tap = UITapGestureRecognizer(target: self, action: #selector(tapped))
         tap.delegate = self
+        let dbl = UITapGestureRecognizer(target: self, action: #selector(doubleTapped))
+        dbl.numberOfTapsRequired = 2
+        dbl.delegate = self
+        tap.require(toFail: dbl)
         view.addGestureRecognizer(tap)
+        view.addGestureRecognizer(dbl)
         let hold = UILongPressGestureRecognizer(target: self, action: #selector(held(_:)))
         hold.minimumPressDuration = 1.0
         hold.delegate = self
         view.addGestureRecognizer(hold)
+
+        NotificationCenter.default.addObserver(forName: UIApplication.didBecomeActiveNotification,
+                                               object: nil, queue: .main) { [weak self] _ in
+            self?.renderer.link.ensureListening()
+        }
     }
 
     @objc private func tapped() { renderer.recenter() }
+
+    @objc private func doubleTapped() { renderer.hudManual.toggle() }
 
     @objc private func held(_ g: UILongPressGestureRecognizer) {
         guard g.state == .began else { return }

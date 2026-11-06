@@ -103,7 +103,7 @@ final class SettingsPanel: UIView {
 
         statusLabel.numberOfLines = 0
         statusLabel.textColor = .green
-        statusLabel.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        statusLabel.font = .monospacedSystemFont(ofSize: 15, weight: .regular)
         stack.addArrangedSubview(statusLabel)
     }
 
