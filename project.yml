@@ -16,6 +16,7 @@ targets:
         UIRequiresFullScreen: true
         NSMotionUsageDescription: Used for head tracking.
         NSLocalNetworkUsageDescription: Used to connect to your PC for VR streaming.
+        NSBonjourServices: [_opencardboard._tcp]
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.example.opencardboard

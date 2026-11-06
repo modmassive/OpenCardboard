@@ -6,6 +6,7 @@ import simd
 final class PCLink {
     private let queue = DispatchQueue(label: "pclink", qos: .userInteractive)
     private var listener: NWListener?
+    private var browser: NWBrowser?
     private var conn: NWConnection?
     private var buffer = Data()
     private var helloData: Data?
@@ -35,6 +36,7 @@ final class PCLink {
             params.allowLocalEndpointReuse = true
             do {
                 let l = try NWListener(using: params, on: NWEndpoint.Port(rawValue: port)!)
+                l.service = NWListener.Service(type: "_opencardboard._tcp")
                 l.stateUpdateHandler = { [weak self] st in
                     guard let self = self, !self.isConnected else { return }
                     self.setState("listening (\(st))")
@@ -42,6 +44,12 @@ final class PCLink {
                 l.newConnectionHandler = { [weak self] c in self?.accept(c) }
                 l.start(queue: self.queue)
                 self.listener = l
+                // Browsing the same service type reliably triggers the Local Network prompt.
+                let b = NWBrowser(for: .bonjour(type: "_opencardboard._tcp", domain: nil), using: .tcp)
+                b.stateUpdateHandler = { _ in }
+                b.browseResultsChangedHandler = { _, _ in }
+                b.start(queue: self.queue)
+                self.browser = b
             } catch {
                 self.setState("listen failed: \(error)")
             }
