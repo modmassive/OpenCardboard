@@ -29,6 +29,7 @@
 #include <algorithm>
 #include <map>
 #include <d3d11.h>
+#include <xinput.h>
 #include <d3d11_4.h>
 #include <d3dcompiler.h>
 #include <condition_variable>
@@ -41,6 +42,7 @@
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "d3dcompiler.lib")
+#pragma comment(lib, "xinput.lib")
 
 using namespace vr;
 using Microsoft::WRL::ComPtr;
@@ -163,6 +165,12 @@ void InstallCrashHandlers() {
 float SettingF(const char* key, float def) {
     EVRSettingsError e = VRSettingsError_None;
     float v = VRSettings()->GetFloat(kSection, key, &e);
+    return e == VRSettingsError_None ? v : def;
+}
+
+bool SettingB(const char* key, bool def) {
+    EVRSettingsError e = VRSettingsError_None;
+    bool v = VRSettings()->GetBool(kSection, key, &e);
     return e == VRSettingsError_None ? v : def;
 }
 
@@ -609,6 +617,141 @@ private:
     std::atomic<bool> ready_{false};
 };
 
+// ---------------------------------------------------------------- gamepad bridge: a gaze-pointing virtual controller
+// SteamVR's menus are operated with a laser pointer + trigger. This device sits in front of the headset,
+// pointing where you look, and takes its buttons from an Xbox-style controller connected to the PC:
+//   A or right trigger = trigger click      Back  = SteamVR button (opens/closes the dashboard)
+//   Start = application menu                Right bumper = grip
+
+void RotateVec(const HmdQuaternion_t& q, double x, double y, double z, double out[3]) {
+    // v' = v + 2w(q x v) + 2 q x (q x v)
+    double tx = 2.0 * (q.y * z - q.z * y);
+    double ty = 2.0 * (q.z * x - q.x * z);
+    double tz = 2.0 * (q.x * y - q.y * x);
+    out[0] = x + q.w * tx + (q.y * tz - q.z * ty);
+    out[1] = y + q.w * ty + (q.z * tx - q.x * tz);
+    out[2] = z + q.w * tz + (q.x * ty - q.y * tx);
+}
+
+class PadDevice : public ITrackedDeviceServerDriver {
+public:
+    PadDevice() {
+        q_.w = 1; q_.x = 0; q_.y = 0; q_.z = 0;
+    }
+    const char* Serial() const { return "OPENCARDBOARD-PAD-001"; }
+
+    EVRInitError Activate(uint32_t id) {
+        id_ = id;
+        PropertyContainerHandle_t c = VRProperties()->TrackedDeviceToPropertyContainer(id);
+        VRProperties()->SetStringProperty(c, Prop_ModelNumber_String, "OpenCardboard Gaze Pointer");
+        VRProperties()->SetStringProperty(c, Prop_ManufacturerName_String, "OpenCardboard");
+        VRProperties()->SetStringProperty(c, Prop_TrackingSystemName_String, "opencardboard");
+        VRProperties()->SetStringProperty(c, Prop_ControllerType_String, "vive_controller");
+        VRProperties()->SetStringProperty(c, Prop_InputProfilePath_String,
+                                          "{htc}/input/vive_controller_profile.json");
+        VRProperties()->SetStringProperty(c, Prop_RenderModelName_String, "vr_controller_vive_1_5");
+        VRProperties()->SetInt32Property(c, Prop_ControllerRoleHint_Int32, TrackedControllerRole_RightHand);
+        VRInputError e1 = VRDriverInput()->CreateBooleanComponent(c, "/input/trigger/click", &hTrigClick_);
+        VRInputError e2 = VRDriverInput()->CreateScalarComponent(c, "/input/trigger/value", &hTrigVal_,
+                                                                  VRScalarType_Absolute, VRScalarUnits_NormalizedOneSided);
+        VRInputError e3 = VRDriverInput()->CreateBooleanComponent(c, "/input/system/click", &hSystem_);
+        VRInputError e4 = VRDriverInput()->CreateBooleanComponent(c, "/input/application_menu/click", &hMenu_);
+        VRInputError e5 = VRDriverInput()->CreateBooleanComponent(c, "/input/grip/click", &hGrip_);
+        Log("gaze pointer activated (object id %u); component results %d %d %d %d %d", id,
+            (int)e1, (int)e2, (int)e3, (int)e4, (int)e5);
+        if (!poll_.joinable()) {
+            stop_ = false;
+            poll_ = std::thread([this] { PollLoop(); });
+        }
+        return VRInitError_None;
+    }
+    void Deactivate() { id_ = k_unTrackedDeviceIndexInvalid; }
+    void EnterStandby() {}
+    void* GetComponent(const char*) { return nullptr; }
+    void DebugRequest(const char*, char* response, uint32_t size) { if (size > 0) response[0] = 0; }
+    DriverPose_t GetPose() { return BuildPose(); }
+
+    void Shutdown() {
+        stop_ = true;
+        if (poll_.joinable()) poll_.join();
+    }
+
+    void SetHmdPose(const HmdQuaternion_t& q, const double pos[3], bool connected) {
+        {
+            std::lock_guard<std::mutex> g(mu_);
+            q_ = q;
+            for (int i = 0; i < 3; i++) pos_[i] = pos[i];
+            connected_ = connected;
+        }
+        uint32_t id = id_;
+        if (id != k_unTrackedDeviceIndexInvalid)
+            VRServerDriverHost()->TrackedDevicePoseUpdated(id, BuildPose(), sizeof(DriverPose_t));
+    }
+
+private:
+    DriverPose_t BuildPose() {
+        DriverPose_t p = {};
+        std::lock_guard<std::mutex> g(mu_);
+        p.qWorldFromDriverRotation.w = 1; p.qWorldFromDriverRotation.x = 0;
+        p.qWorldFromDriverRotation.y = 0; p.qWorldFromDriverRotation.z = 0;
+        p.qDriverFromHeadRotation.w = 1;  p.qDriverFromHeadRotation.x = 0;
+        p.qDriverFromHeadRotation.y = 0;  p.qDriverFromHeadRotation.z = 0;
+        p.qRotation = q_;
+        double off[3];
+        RotateVec(q_, 0.0, -0.12, -0.25, off);     // a little below and in front of the eyes
+        for (int i = 0; i < 3; i++) p.vecPosition[i] = pos_[i] + off[i];
+        p.poseIsValid = connected_;
+        p.deviceIsConnected = connected_;
+        p.result = connected_ ? TrackingResult_Running_OK : TrackingResult_Uninitialized;
+        return p;
+    }
+
+    void PollLoop() {
+        bool lTrig = false, lSys = false, lMenu = false, lGrip = false;
+        float lVal = -1.0f;
+        while (!stop_) {
+            XINPUT_STATE st;
+            bool have = false;
+            for (DWORD i = 0; i < 4 && !have; i++) {
+                ZeroMemory(&st, sizeof(st));
+                if (XInputGetState(i, &st) == ERROR_SUCCESS) have = true;
+            }
+            bool trig = false, sys = false, menu = false, grip = false;
+            float val = 0.0f;
+            if (have) {
+                WORD b = st.Gamepad.wButtons;
+                val = st.Gamepad.bRightTrigger / 255.0f;
+                trig = (b & XINPUT_GAMEPAD_A) || val > 0.5f;
+                sys = (b & XINPUT_GAMEPAD_BACK) != 0;
+                menu = (b & XINPUT_GAMEPAD_START) != 0;
+                grip = (b & XINPUT_GAMEPAD_RIGHT_SHOULDER) != 0;
+                if (trig && val < 0.5f) val = 1.0f;
+            }
+            if (id_ != k_unTrackedDeviceIndexInvalid) {
+                if (trig != lTrig) { VRDriverInput()->UpdateBooleanComponent(hTrigClick_, trig, 0.0); lTrig = trig; Log("pad: trigger %s", trig ? "down" : "up"); }
+                if (val != lVal)   { VRDriverInput()->UpdateScalarComponent(hTrigVal_, val, 0.0); lVal = val; }
+                if (sys != lSys)   { VRDriverInput()->UpdateBooleanComponent(hSystem_, sys, 0.0); lSys = sys; Log("pad: system button %s", sys ? "down" : "up"); }
+                if (menu != lMenu) { VRDriverInput()->UpdateBooleanComponent(hMenu_, menu, 0.0); lMenu = menu; }
+                if (grip != lGrip) { VRDriverInput()->UpdateBooleanComponent(hGrip_, grip, 0.0); lGrip = grip; }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(8));
+        }
+    }
+
+    std::atomic<uint32_t> id_{k_unTrackedDeviceIndexInvalid};
+    VRInputComponentHandle_t hTrigClick_ = k_ulInvalidInputComponentHandle;
+    VRInputComponentHandle_t hTrigVal_ = k_ulInvalidInputComponentHandle;
+    VRInputComponentHandle_t hSystem_ = k_ulInvalidInputComponentHandle;
+    VRInputComponentHandle_t hMenu_ = k_ulInvalidInputComponentHandle;
+    VRInputComponentHandle_t hGrip_ = k_ulInvalidInputComponentHandle;
+    std::mutex mu_;
+    HmdQuaternion_t q_;
+    double pos_[3] = {0, 1.6, 0};
+    bool connected_ = false;
+    std::thread poll_;
+    std::atomic<bool> stop_{false};
+};
+
 // ---------------------------------------------------------------- the headset
 
 class HmdDevice : public ITrackedDeviceServerDriver, public IVRDisplayComponent,
@@ -720,7 +863,10 @@ public:
     // ---- called from the network thread
     void SetConnected(bool c) {
         { std::lock_guard<std::mutex> g(mu_); connected_ = c; }
-        if (!c) streamer_.Stop();
+        if (!c) {
+            streamer_.Stop();
+            if (pad_) { double pp[3] = {0, headHeight_, 0}; pad_->SetHmdPose(q_, pp, false); }
+        }
         PushPose();
     }
     void OnHello(const float fl[4], const float fr[4]) {
@@ -728,6 +874,7 @@ public:
     }
     void SetSender(std::function<bool(uint16_t, const uint8_t*, uint32_t)> f) { sender_ = f; }
     bool HasD3D() const { return d3dReady_; }
+    void SetPad(PadDevice* p) { pad_ = p; }
     void SetIpdMM(float mm) {
         float m = mm / 1000.0f;
         if (m < 0.04f || m > 0.09f) return;
@@ -783,6 +930,10 @@ public:
             std::lock_guard<std::mutex> g(mu_);
             q_ = q;
             for (int i = 0; i < 3; i++) pos_[i] = pos[i];
+        }
+        if (pad_) {
+            double pp[3] = {pos[0], headHeight_ + pos[1], pos[2]};
+            pad_->SetHmdPose(q, pp, true);
         }
         PushPose();
     }
@@ -984,6 +1135,7 @@ private:
     std::function<bool(uint16_t, const uint8_t*, uint32_t)> sender_;
     std::atomic<uint32_t> videoSeq_{0};
     std::atomic<bool> d3dReady_{false};
+    PadDevice* pad_ = nullptr;
     PropertyContainerHandle_t props_ = k_ulInvalidPropertyContainer;
     std::string encoderPreset_;
     int streamEyeW_ = 1280, streamEyeH_ = 1280, mbps_ = 40;
@@ -1273,6 +1425,12 @@ public:
         Log("TrackedDeviceAdded returned %d", added ? 1 : 0);
         std::string host = SettingS("phoneAddress", "172.20.10.1");
         int port = SettingI("phonePort", 9000);
+        if (SettingB("gamepadBridge", true)) {
+            pad_ = new PadDevice();
+            bool added = VRServerDriverHost()->TrackedDeviceAdded(pad_->Serial(), TrackedDeviceClass_Controller, pad_);
+            Log("gaze pointer added: %d", added ? 1 : 0);
+            hmd_->SetPad(pad_);
+        }
         hmd_->SetSender([this](uint16_t t, const uint8_t* p, uint32_t n) { return net_.Send(t, p, n); });
         net_.SetTransport(SettingS("phoneTransport", "auto"));
         net_.Start(host, (uint16_t)port, hmd_);
@@ -1281,6 +1439,7 @@ public:
     }
     void Cleanup() {
         Log("Provider::Cleanup begin");
+        if (pad_) pad_->Shutdown();
         if (hmd_) hmd_->Shutdown();
         net_.Stop();
         hmd_ = nullptr;     // intentionally not deleted: SteamVR may still hold the pointer
@@ -1298,6 +1457,7 @@ public:
 
 private:
     HmdDevice* hmd_ = nullptr;
+    PadDevice* pad_ = nullptr;
     NetClient net_;
 };
 
