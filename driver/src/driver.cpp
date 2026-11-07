@@ -284,7 +284,7 @@ public:
     bool Ready() const { return ready_; }
 
     bool Start(ID3D11Device* dev, ID3D11DeviceContext* ctx, int eyeW, int eyeH, int fps, int mbps,
-               const std::string& ffmpegSetting, AUCallback cb) {
+               const std::string& ffmpegSetting, const std::string& preset, AUCallback cb) {
         std::lock_guard<std::mutex> life(lifeMu_);
         StopLocked();
         dev_ = dev; ctx_ = ctx; eyeW_ = eyeW; eyeH_ = eyeH; cb_ = cb;
@@ -337,7 +337,7 @@ public:
         for (int i = 0; i < kRing; i++)
             if (FAILED(dev_->CreateTexture2D(&sg, nullptr, &stage_[i]))) return false;
 
-        if (!LaunchFfmpeg(FindFfmpeg(ffmpegSetting), eyeW * 2, eyeH, fps, mbps)) return false;
+        if (!LaunchFfmpeg(FindFfmpeg(ffmpegSetting), eyeW * 2, eyeH, fps, mbps, preset)) return false;
 
         stop_ = false;
         writeIdx_ = 0;
@@ -430,7 +430,7 @@ private:
         return v;
     }
 
-    bool LaunchFfmpeg(const std::string& exe, int w, int h, int fps, int mbps) {
+    bool LaunchFfmpeg(const std::string& exe, int w, int h, int fps, int mbps, const std::string& preset) {
         char logDir[MAX_PATH];
         DWORD n = GetEnvironmentVariableA("LOCALAPPDATA", logDir, MAX_PATH);
         std::string logPath = (n > 0 && n < MAX_PATH) ? std::string(logDir) + "\\opencardboard-ffmpeg.log"
@@ -447,10 +447,10 @@ private:
         char cmd[2048];
         snprintf(cmd, sizeof(cmd),
                  "\"%s\" -hide_banner -loglevel warning -f rawvideo -pix_fmt rgb0 -s %dx%d -r %d -i - -an "
-                 "-c:v h264_nvenc -preset p1 -tune ll -rc cbr -b:v %dM -maxrate %dM -bufsize %dM "
+                 "-c:v h264_nvenc -preset %s -tune ll -rc cbr -b:v %dM -maxrate %dM -bufsize %dM "
                  "-g %d -bf 0 -zerolatency 1 -delay 0 -forced-idr 1 -aud 1 "
                  "-bsf:v dump_extra=freq=keyframe -f h264 -",
-                 exe.c_str(), w, h, fps, mbps, mbps, std::max(1, mbps / std::max(fps, 1) + 1), fps);
+                 exe.c_str(), w, h, fps, preset.c_str(), mbps, mbps, std::max(1, mbps / std::max(fps, 1) + 1), fps);
         Log("launching: %s", cmd);
 
         STARTUPINFOA si = {};
@@ -627,6 +627,7 @@ public:
         streamEyeH_ = SettingI("streamEyeHeight", 1280);
         mbps_ = SettingI("bitrateMbps", 40);
         ffmpegPath_ = SettingS("ffmpegPath", "auto");
+        encoderPreset_ = SettingS("encoderPreset", "p1");
         float fov = SettingF("fovTan", 1.2f);
         for (int e = 0; e < 2; e++)
             for (int i = 0; i < 4; i++) frust_[e][i] = fov;
@@ -639,6 +640,7 @@ public:
     EVRInitError Activate(uint32_t objectId) {
         objectId_ = objectId;
         PropertyContainerHandle_t c = VRProperties()->TrackedDeviceToPropertyContainer(objectId);
+        props_ = c;
         VRProperties()->SetStringProperty(c, Prop_ModelNumber_String, model_.c_str());
         VRProperties()->SetStringProperty(c, Prop_ManufacturerName_String, "OpenCardboard");
         VRProperties()->SetStringProperty(c, Prop_TrackingSystemName_String, "opencardboard");
@@ -722,11 +724,20 @@ public:
     }
     void SetSender(std::function<bool(uint16_t, const uint8_t*, uint32_t)> f) { sender_ = f; }
     bool HasD3D() const { return d3dReady_; }
+    void SetIpdMM(float mm) {
+        float m = mm / 1000.0f;
+        if (m < 0.04f || m > 0.09f) return;
+        ipd_ = m;
+        if (props_ != k_ulInvalidPropertyContainer) {
+            VRProperties()->SetFloatProperty(props_, Prop_UserIpdMeters_Float, m);
+            Log("IPD set to %.1f mm (from the phone)", mm);
+        }
+    }
     void OnPhoneReady() {
         if (!d3dReady_) { Log("no D3D device yet - will retry"); return; }
         if (streamer_.Ready()) { SendStreamConfig(); return; }     // already running
         bool ok = streamer_.Start(dev_.Get(), ctx_.Get(), streamEyeW_, streamEyeH_, (int)(freq_ + 0.5f), mbps_,
-                                  ffmpegPath_,
+                                  ffmpegPath_, encoderPreset_,
                                   [this](const float* rot, const float* pos, bool key, const uint8_t* au, size_t n) {
                                       SendVideo(rot, pos, key, au, n);
                                   });
@@ -969,6 +980,8 @@ private:
     std::function<bool(uint16_t, const uint8_t*, uint32_t)> sender_;
     std::atomic<uint32_t> videoSeq_{0};
     std::atomic<bool> d3dReady_{false};
+    PropertyContainerHandle_t props_ = k_ulInvalidPropertyContainer;
+    std::string encoderPreset_;
     int streamEyeW_ = 1280, streamEyeH_ = 1280, mbps_ = 40;
     std::string ffmpegPath_;
     std::atomic<uint64_t> presented_{0};
@@ -1082,6 +1095,9 @@ private:
                 memcpy(fl, payload.data() + 28, 16);
                 memcpy(fr, payload.data() + 44, 16);
                 hmd_->OnHello(fl, fr);
+                float ipdMM;
+                memcpy(&ipdMM, payload.data() + 8, 4);
+                hmd_->SetIpdMM(ipdMM);
                 needStart = true;
                 Log("phone hello: left eye frustum l=%.2f r=%.2f u=%.2f d=%.2f", fl[0], fl[1], fl[2], fl[3]);
             } else if (type == MSG_POSE && len >= 64) {
