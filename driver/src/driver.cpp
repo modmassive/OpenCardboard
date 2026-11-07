@@ -651,6 +651,7 @@ public:
         if (InitD3D()) {
             VRProperties()->SetUint64Property(c, Prop_GraphicsAdapterLuid_Uint64,
                 ((uint64_t)luid_.HighPart << 32) | (uint64_t)luid_.LowPart);
+            d3dReady_ = true;
         } else {
             Log("D3D11 init FAILED - direct mode will not work");
         }
@@ -720,8 +721,10 @@ public:
         Log("phone prefers frustum l=%.2f r=%.2f u=%.2f d=%.2f (not applied yet)", fl[0], fl[1], fl[2], fl[3]);
     }
     void SetSender(std::function<bool(uint16_t, const uint8_t*, uint32_t)> f) { sender_ = f; }
+    bool HasD3D() const { return d3dReady_; }
     void OnPhoneReady() {
-        if (!dev_) { Log("no D3D device - cannot stream"); return; }
+        if (!d3dReady_) { Log("no D3D device yet - will retry"); return; }
+        if (streamer_.Ready()) { SendStreamConfig(); return; }     // already running
         bool ok = streamer_.Start(dev_.Get(), ctx_.Get(), streamEyeW_, streamEyeH_, (int)(freq_ + 0.5f), mbps_,
                                   ffmpegPath_,
                                   [this](const float* rot, const float* pos, bool key, const uint8_t* au, size_t n) {
@@ -965,6 +968,7 @@ private:
     Streamer streamer_;
     std::function<bool(uint16_t, const uint8_t*, uint32_t)> sender_;
     std::atomic<uint32_t> videoSeq_{0};
+    std::atomic<bool> d3dReady_{false};
     int streamEyeW_ = 1280, streamEyeH_ = 1280, mbps_ = 40;
     std::string ffmpegPath_;
     std::atomic<uint64_t> presented_{0};
@@ -1063,6 +1067,7 @@ private:
         std::vector<uint8_t> payload;
         auto lastReport = std::chrono::steady_clock::now();
         int poses = 0;
+        bool needStart = false;
         while (!stop_) {
             uint8_t hdr[12];
             if (!RecvAll(s, hdr, 12)) { Log("phone link: receive failed or timed out"); return; }
@@ -1077,7 +1082,7 @@ private:
                 memcpy(fl, payload.data() + 28, 16);
                 memcpy(fr, payload.data() + 44, 16);
                 hmd_->OnHello(fl, fr);
-                hmd_->OnPhoneReady();
+                needStart = true;
                 Log("phone hello: left eye frustum l=%.2f r=%.2f u=%.2f d=%.2f", fl[0], fl[1], fl[2], fl[3]);
             } else if (type == MSG_POSE && len >= 64) {
                 float rot[9], pos[3];
@@ -1087,6 +1092,11 @@ private:
                 poses++;
             } else if (type == MSG_PING) {
                 if (!SendMsg(s, MSG_PONG, payload.data(), len)) return;
+            }
+
+            if (needStart && hmd_->HasD3D()) {
+                needStart = false;
+                hmd_->OnPhoneReady();
             }
 
             auto now = std::chrono::steady_clock::now();
