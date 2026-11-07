@@ -2,8 +2,12 @@
 // The phone listens on TCP (default 172.20.10.1:9000, the USB-hotspot address); this driver connects to it.
 // Protocol: see PROTOCOL.md in the repository root.
 
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
@@ -1076,7 +1080,7 @@ private:
         SOCKET s = MuxSocket();
         if (s == INVALID_SOCKET) { UsbNote("usb: Apple's USB service is not reachable (127.0.0.1:27015)"); return s; }
         std::string resp;
-        if (!MuxRequest(s, "ListDevices", -1, 1, resp)) {
+        if (!MuxRequest(s, "ListDevices", -1, 1, 0, resp)) {
             closesocket(s);
             UsbNote("usb: no usable reply to ListDevices");
             return INVALID_SOCKET;
