@@ -25,12 +25,17 @@
 #include <algorithm>
 #include <map>
 #include <d3d11.h>
+#include <d3dcompiler.h>
+#include <condition_variable>
+#include <deque>
+#include <functional>
 #include <dxgi.h>
 #include <wrl/client.h>
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
+#pragma comment(lib, "d3dcompiler.lib")
 
 using namespace vr;
 using Microsoft::WRL::ComPtr;
@@ -209,6 +214,396 @@ HmdQuaternion_t QuatFromMatrix(const float m[3][3]) {
     return q;
 }
 
+// ---------------------------------------------------------------- video: side-by-side + ffmpeg/NVENC
+// First-light version: the GPU composes both eyes into one frame, the frame is read back to the CPU and
+// piped to ffmpeg (h264_nvenc), and ffmpeg's output is split into access units and sent to the phone.
+// Later this can be replaced with a direct NVENC path for lower latency.
+
+const char* kHlsl = R"HLSL(
+cbuffer CB : register(b0) { float4 bounds; };
+struct VSOut { float4 pos : SV_POSITION; float2 uv : TEXCOORD0; };
+VSOut VS(uint id : SV_VertexID) {
+    VSOut o;
+    float2 p = float2((id << 1) & 2, id & 2);
+    o.pos = float4(p * float2(2, -2) + float2(-1, 1), 0, 1);
+    o.uv = p;
+    return o;
+}
+Texture2D tex : register(t0);
+SamplerState smp : register(s0);
+float4 PS(VSOut i) : SV_TARGET {
+    float2 uv = float2(lerp(bounds.x, bounds.z, i.uv.x), lerp(bounds.y, bounds.w, i.uv.y));
+    return tex.Sample(smp, uv);
+}
+)HLSL";
+
+std::string FindFfmpeg(const std::string& setting) {
+    if (!setting.empty() && setting != "auto") return setting;
+    char base[MAX_PATH];
+    DWORD n = GetEnvironmentVariableA("LOCALAPPDATA", base, MAX_PATH);
+    if (n > 0 && n < MAX_PATH) {
+        std::string pk = std::string(base) + "\\Microsoft\\WinGet\\Packages\\";
+        WIN32_FIND_DATAA fd;
+        HANDLE h = FindFirstFileA((pk + "Gyan.FFmpeg*").c_str(), &fd);
+        if (h != INVALID_HANDLE_VALUE) {
+            do {
+                if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+                std::string d1 = pk + fd.cFileName + "\\";
+                WIN32_FIND_DATAA f2;
+                HANDLE h2 = FindFirstFileA((d1 + "ffmpeg-*").c_str(), &f2);
+                if (h2 != INVALID_HANDLE_VALUE) {
+                    do {
+                        std::string exe = d1 + f2.cFileName + "\\bin\\ffmpeg.exe";
+                        if (GetFileAttributesA(exe.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                            FindClose(h2); FindClose(h);
+                            return exe;
+                        }
+                    } while (FindNextFileA(h2, &f2));
+                    FindClose(h2);
+                }
+            } while (FindNextFileA(h, &fd));
+            FindClose(h);
+        }
+    }
+    return "ffmpeg";
+}
+
+bool HasIdr(const uint8_t* d, size_t n) {
+    for (size_t i = 0; i + 3 < n; i++) {
+        if (d[i] == 0 && d[i + 1] == 0 && d[i + 2] == 1 && (d[i + 3] & 0x1F) == 5) return true;
+    }
+    return false;
+}
+
+class Streamer {
+public:
+    using AUCallback = std::function<void(const float* rot, const float* pos, bool key,
+                                          const uint8_t* data, size_t len)>;
+
+    bool Ready() const { return ready_; }
+
+    bool Start(ID3D11Device* dev, ID3D11DeviceContext* ctx, int eyeW, int eyeH, int fps, int mbps,
+               const std::string& ffmpegSetting, AUCallback cb) {
+        std::lock_guard<std::mutex> life(lifeMu_);
+        StopLocked();
+        dev_ = dev; ctx_ = ctx; eyeW_ = eyeW; eyeH_ = eyeH; cb_ = cb;
+        ComPtr<ID3D11Multithread> mt;
+        if (SUCCEEDED(ctx_.As(&mt))) mt->SetMultithreadProtected(TRUE);
+
+        ComPtr<ID3DBlob> vsb, psb, err;
+        HRESULT hr = D3DCompile(kHlsl, strlen(kHlsl), "oc", nullptr, nullptr, "VS", "vs_4_0", 0, 0, &vsb, &err);
+        if (FAILED(hr)) { Log("HLSL VS compile failed: %s", err ? (const char*)err->GetBufferPointer() : "?"); return false; }
+        hr = D3DCompile(kHlsl, strlen(kHlsl), "oc", nullptr, nullptr, "PS", "ps_4_0", 0, 0, &psb, &err);
+        if (FAILED(hr)) { Log("HLSL PS compile failed: %s", err ? (const char*)err->GetBufferPointer() : "?"); return false; }
+        if (FAILED(dev_->CreateVertexShader(vsb->GetBufferPointer(), vsb->GetBufferSize(), nullptr, &vs_))) return false;
+        if (FAILED(dev_->CreatePixelShader(psb->GetBufferPointer(), psb->GetBufferSize(), nullptr, &ps_))) return false;
+
+        D3D11_BUFFER_DESC bd = {};
+        bd.ByteWidth = 16;
+        bd.Usage = D3D11_USAGE_DEFAULT;
+        bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        if (FAILED(dev_->CreateBuffer(&bd, nullptr, &cb_buf_))) return false;
+
+        D3D11_SAMPLER_DESC sd = {};
+        sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+        sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+        sd.ComparisonFunc = D3D11_COMPARISON_NEVER;
+        sd.MaxLOD = D3D11_FLOAT32_MAX;
+        if (FAILED(dev_->CreateSamplerState(&sd, &smp_))) return false;
+
+        D3D11_RASTERIZER_DESC rd = {};
+        rd.FillMode = D3D11_FILL_SOLID;
+        rd.CullMode = D3D11_CULL_NONE;
+        rd.DepthClipEnable = TRUE;
+        if (FAILED(dev_->CreateRasterizerState(&rd, &rs_))) return false;
+
+        D3D11_TEXTURE2D_DESC td = {};
+        td.Width = (UINT)(eyeW * 2);
+        td.Height = (UINT)eyeH;
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_RENDER_TARGET;
+        if (FAILED(dev_->CreateTexture2D(&td, nullptr, &out_))) return false;
+        if (FAILED(dev_->CreateRenderTargetView(out_.Get(), nullptr, &rtv_))) return false;
+
+        D3D11_TEXTURE2D_DESC sg = td;
+        sg.Usage = D3D11_USAGE_STAGING;
+        sg.BindFlags = 0;
+        sg.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        for (int i = 0; i < kRing; i++)
+            if (FAILED(dev_->CreateTexture2D(&sg, nullptr, &stage_[i]))) return false;
+
+        if (!LaunchFfmpeg(FindFfmpeg(ffmpegSetting), eyeW * 2, eyeH, fps, mbps)) return false;
+
+        stop_ = false;
+        writeIdx_ = 0;
+        inflight_ = 0;
+        q_.clear();
+        poses_.clear();
+        running_ = true;
+        writer_ = std::thread([this] { WriterLoop(); });
+        reader_ = std::thread([this] { ReaderLoop(); });
+        ready_ = true;
+        Log("streamer started: %dx%d per eye, %d fps, %d Mbps", eyeW, eyeH, fps, mbps);
+        return true;
+    }
+
+    void Stop() {
+        std::lock_guard<std::mutex> life(lifeMu_);
+        StopLocked();
+    }
+
+    void ForgetTextures() { srvCache_.clear(); }
+
+    // called from Present() while the compositor's sync mutex is held
+    void SubmitFrame(ID3D11Texture2D* left, const VRTextureBounds_t& bl,
+                     ID3D11Texture2D* right, const VRTextureBounds_t& br,
+                     const float rot[9], const float pos[3]) {
+        std::unique_lock<std::mutex> life(lifeMu_, std::try_to_lock);
+        if (!life.owns_lock() || !ready_) return;
+        int slot;
+        {
+            std::lock_guard<std::mutex> g(qmu_);
+            if (inflight_ >= kRing) { dropped_++; return; }
+            slot = writeIdx_;
+            writeIdx_ = (writeIdx_ + 1) % kRing;
+            inflight_++;
+        }
+        ComPtr<ID3D11ShaderResourceView> sl = Srv(left), sr = Srv(right);
+        if (!sl || !sr) {
+            std::lock_guard<std::mutex> g(qmu_);
+            inflight_--;
+            writeIdx_ = (writeIdx_ + kRing - 1) % kRing;
+            return;
+        }
+
+        ctx_->OMSetRenderTargets(1, rtv_.GetAddressOf(), nullptr);
+        ctx_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        ctx_->IASetInputLayout(nullptr);
+        ctx_->VSSetShader(vs_.Get(), nullptr, 0);
+        ctx_->PSSetShader(ps_.Get(), nullptr, 0);
+        ctx_->PSSetSamplers(0, 1, smp_.GetAddressOf());
+        ctx_->PSSetConstantBuffers(0, 1, cb_buf_.GetAddressOf());
+        ctx_->RSSetState(rs_.Get());
+        for (int e = 0; e < 2; e++) {
+            D3D11_VIEWPORT vp = {(float)(e * eyeW_), 0.0f, (float)eyeW_, (float)eyeH_, 0.0f, 1.0f};
+            ctx_->RSSetViewports(1, &vp);
+            const VRTextureBounds_t& b = (e == 0) ? bl : br;
+            float cbv[4] = {b.uMin, b.vMin, b.uMax, b.vMax};
+            ctx_->UpdateSubresource(cb_buf_.Get(), 0, nullptr, cbv, 0, 0);
+            ID3D11ShaderResourceView* srv = (e == 0) ? sl.Get() : sr.Get();
+            ctx_->PSSetShaderResources(0, 1, &srv);
+            ctx_->Draw(3, 0);
+        }
+        ID3D11ShaderResourceView* nullSrv = nullptr;
+        ctx_->PSSetShaderResources(0, 1, &nullSrv);
+        ID3D11RenderTargetView* nullRtv = nullptr;
+        ctx_->OMSetRenderTargets(1, &nullRtv, nullptr);
+        ctx_->CopyResource(stage_[slot].Get(), out_.Get());
+        ctx_->Flush();
+
+        Item it;
+        it.slot = slot;
+        memcpy(it.rot, rot, sizeof(it.rot));
+        memcpy(it.pos, pos, sizeof(it.pos));
+        {
+            std::lock_guard<std::mutex> g(qmu_);
+            q_.push_back(it);
+        }
+        cv_.notify_one();
+    }
+
+private:
+    static constexpr int kRing = 3;
+    struct Item { int slot = 0; float rot[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1}; float pos[3] = {0, 0, 0}; };
+
+    ComPtr<ID3D11ShaderResourceView> Srv(ID3D11Texture2D* t) {
+        auto it = srvCache_.find(t);
+        if (it != srvCache_.end()) return it->second;
+        ComPtr<ID3D11ShaderResourceView> v;
+        if (FAILED(dev_->CreateShaderResourceView(t, nullptr, &v))) Log("CreateShaderResourceView failed");
+        srvCache_[t] = v;
+        return v;
+    }
+
+    bool LaunchFfmpeg(const std::string& exe, int w, int h, int fps, int mbps) {
+        char logDir[MAX_PATH];
+        DWORD n = GetEnvironmentVariableA("LOCALAPPDATA", logDir, MAX_PATH);
+        std::string logPath = (n > 0 && n < MAX_PATH) ? std::string(logDir) + "\\opencardboard-ffmpeg.log"
+                                                      : std::string("opencardboard-ffmpeg.log");
+        SECURITY_ATTRIBUTES sa = {sizeof(sa), nullptr, TRUE};
+        HANDLE inR = nullptr, inW = nullptr, outR = nullptr, outW = nullptr;
+        if (!CreatePipe(&inR, &inW, &sa, 16u << 20)) return false;
+        if (!CreatePipe(&outR, &outW, &sa, 4u << 20)) return false;
+        SetHandleInformation(inW, HANDLE_FLAG_INHERIT, 0);
+        SetHandleInformation(outR, HANDLE_FLAG_INHERIT, 0);
+        HANDLE errF = CreateFileA(logPath.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa,
+                                  CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+
+        char cmd[2048];
+        snprintf(cmd, sizeof(cmd),
+                 "\"%s\" -hide_banner -loglevel warning -f rawvideo -pix_fmt rgb0 -s %dx%d -r %d -i - -an "
+                 "-c:v h264_nvenc -preset p1 -tune ll -rc cbr -b:v %dM -maxrate %dM -bufsize %dM "
+                 "-g %d -bf 0 -zerolatency 1 -delay 0 -forced-idr 1 -aud 1 "
+                 "-bsf:v dump_extra=freq=keyframe -f h264 -",
+                 exe.c_str(), w, h, fps, mbps, mbps, std::max(1, mbps / std::max(fps, 1) + 1), fps);
+        Log("launching: %s", cmd);
+
+        STARTUPINFOA si = {};
+        si.cb = sizeof(si);
+        si.dwFlags = STARTF_USESTDHANDLES;
+        si.hStdInput = inR;
+        si.hStdOutput = outW;
+        si.hStdError = (errF != INVALID_HANDLE_VALUE) ? errF : GetStdHandle(STD_ERROR_HANDLE);
+        PROCESS_INFORMATION pi = {};
+        BOOL ok = CreateProcessA(nullptr, cmd, nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+        DWORD lastErr = GetLastError();
+        CloseHandle(inR);
+        CloseHandle(outW);
+        if (errF != INVALID_HANDLE_VALUE) CloseHandle(errF);
+        if (!ok) {
+            Log("could not start ffmpeg (error %lu). Set ffmpegPath in default.vrsettings.", (unsigned long)lastErr);
+            CloseHandle(inW);
+            CloseHandle(outR);
+            return false;
+        }
+        CloseHandle(pi.hThread);
+        proc_ = pi.hProcess;
+        hIn_ = inW;
+        hOut_ = outR;
+        return true;
+    }
+
+    static bool WriteAll(HANDLE h, const uint8_t* d, size_t n) {
+        size_t off = 0;
+        while (off < n) {
+            DWORD wrote = 0;
+            DWORD chunk = (DWORD)std::min<size_t>(n - off, 1u << 20);
+            if (!WriteFile(h, d + off, chunk, &wrote, nullptr) || wrote == 0) return false;
+            off += wrote;
+        }
+        return true;
+    }
+
+    void WriterLoop() {
+        const size_t W = (size_t)eyeW_ * 2, H = (size_t)eyeH_;
+        std::vector<uint8_t> frame(W * H * 4);
+        while (true) {
+            Item it;
+            {
+                std::unique_lock<std::mutex> lk(qmu_);
+                cv_.wait(lk, [&] { return stop_ || !q_.empty(); });
+                if (stop_) break;
+                it = q_.front();
+                q_.pop_front();
+            }
+            bool wrote = false;
+            D3D11_MAPPED_SUBRESOURCE m;
+            if (SUCCEEDED(ctx_->Map(stage_[it.slot].Get(), 0, D3D11_MAP_READ, 0, &m))) {
+                for (size_t y = 0; y < H; y++)
+                    memcpy(frame.data() + y * W * 4, (const uint8_t*)m.pData + y * m.RowPitch, W * 4);
+                ctx_->Unmap(stage_[it.slot].Get(), 0);
+                {
+                    std::lock_guard<std::mutex> g(poseMu_);
+                    poses_.push_back(it);
+                }
+                wrote = true;
+            }
+            {
+                std::lock_guard<std::mutex> g(qmu_);
+                inflight_--;
+            }
+            if (wrote && !WriteAll(hIn_, frame.data(), frame.size())) {
+                if (!stop_) Log("ffmpeg input pipe closed - see opencardboard-ffmpeg.log");
+                ready_ = false;
+                break;
+            }
+        }
+    }
+
+    void ReaderLoop() {
+        std::vector<uint8_t> buf;
+        std::vector<uint8_t> chunk(1 << 16);
+        uint64_t sent = 0;
+        while (true) {
+            DWORD n = 0;
+            if (!ReadFile(hOut_, chunk.data(), (DWORD)chunk.size(), &n, nullptr) || n == 0) break;
+            buf.insert(buf.end(), chunk.begin(), chunk.begin() + n);
+
+            std::vector<size_t> starts;
+            for (size_t i = 0; i + 3 < buf.size(); i++) {
+                if (buf[i] == 0 && buf[i + 1] == 0 && buf[i + 2] == 1 && buf[i + 3] == 9)
+                    starts.push_back((i > 0 && buf[i - 1] == 0) ? i - 1 : i);
+            }
+            if (starts.size() < 2) continue;
+            for (size_t k = 0; k + 1 < starts.size(); k++) {
+                const uint8_t* au = buf.data() + starts[k];
+                size_t len = starts[k + 1] - starts[k];
+                Item pose;
+                {
+                    std::lock_guard<std::mutex> g(poseMu_);
+                    if (!poses_.empty()) { pose = poses_.front(); poses_.pop_front(); }
+                }
+                if (cb_) cb_(pose.rot, pose.pos, HasIdr(au, len), au, len);
+                sent++;
+                if (sent == 1 || sent % 600 == 0) Log("streamer: %llu frames sent to the phone", (unsigned long long)sent);
+            }
+            buf.erase(buf.begin(), buf.begin() + starts.back());
+        }
+    }
+
+    void StopLocked() {
+        if (!running_) return;
+        ready_ = false;
+        {
+            std::lock_guard<std::mutex> g(qmu_);
+            stop_ = true;
+        }
+        cv_.notify_all();
+        if (proc_) TerminateProcess(proc_, 0);
+        if (writer_.joinable()) writer_.join();
+        if (reader_.joinable()) reader_.join();
+        if (hIn_) { CloseHandle(hIn_); hIn_ = nullptr; }
+        if (hOut_) { CloseHandle(hOut_); hOut_ = nullptr; }
+        if (proc_) { CloseHandle(proc_); proc_ = nullptr; }
+        srvCache_.clear();
+        for (int i = 0; i < kRing; i++) stage_[i].Reset();
+        out_.Reset();
+        rtv_.Reset();
+        running_ = false;
+        Log("streamer stopped");
+    }
+
+    ComPtr<ID3D11Device> dev_;
+    ComPtr<ID3D11DeviceContext> ctx_;
+    ComPtr<ID3D11VertexShader> vs_;
+    ComPtr<ID3D11PixelShader> ps_;
+    ComPtr<ID3D11Buffer> cb_buf_;
+    ComPtr<ID3D11SamplerState> smp_;
+    ComPtr<ID3D11RasterizerState> rs_;
+    ComPtr<ID3D11Texture2D> out_;
+    ComPtr<ID3D11RenderTargetView> rtv_;
+    ComPtr<ID3D11Texture2D> stage_[kRing];
+    std::map<ID3D11Texture2D*, ComPtr<ID3D11ShaderResourceView>> srvCache_;
+    int eyeW_ = 0, eyeH_ = 0;
+    AUCallback cb_;
+
+    HANDLE proc_ = nullptr, hIn_ = nullptr, hOut_ = nullptr;
+    std::thread writer_, reader_;
+    std::mutex lifeMu_, qmu_, poseMu_;
+    std::condition_variable cv_;
+    std::deque<Item> q_;
+    std::deque<Item> poses_;
+    int writeIdx_ = 0, inflight_ = 0;
+    uint64_t dropped_ = 0;
+    bool stop_ = false;
+    bool running_ = false;
+    std::atomic<bool> ready_{false};
+};
+
 // ---------------------------------------------------------------- the headset
 
 class HmdDevice : public ITrackedDeviceServerDriver, public IVRDisplayComponent,
@@ -227,6 +622,10 @@ public:
         ipd_ = SettingF("ipd", 0.064f);
         photons_ = SettingF("secondsFromVsyncToPhotons", 0.011f);
         headHeight_ = SettingF("headHeight", 1.6f);
+        streamEyeW_ = SettingI("streamEyeWidth", 1280);
+        streamEyeH_ = SettingI("streamEyeHeight", 1280);
+        mbps_ = SettingI("bitrateMbps", 40);
+        ffmpegPath_ = SettingS("ffmpegPath", "auto");
         float fov = SettingF("fovTan", 1.2f);
         for (int e = 0; e < 2; e++)
             for (int i = 0; i < 4; i++) frust_[e][i] = fov;
@@ -313,11 +712,48 @@ public:
     // ---- called from the network thread
     void SetConnected(bool c) {
         { std::lock_guard<std::mutex> g(mu_); connected_ = c; }
+        if (!c) streamer_.Stop();
         PushPose();
     }
     void OnHello(const float fl[4], const float fr[4]) {
-        std::lock_guard<std::mutex> g(mu_);
-        for (int i = 0; i < 4; i++) { frust_[0][i] = fl[i]; frust_[1][i] = fr[i]; }
+        Log("phone prefers frustum l=%.2f r=%.2f u=%.2f d=%.2f (not applied yet)", fl[0], fl[1], fl[2], fl[3]);
+    }
+    void SetSender(std::function<bool(uint16_t, const uint8_t*, uint32_t)> f) { sender_ = f; }
+    void OnPhoneReady() {
+        if (!dev_) { Log("no D3D device - cannot stream"); return; }
+        bool ok = streamer_.Start(dev_.Get(), ctx_.Get(), streamEyeW_, streamEyeH_, (int)(freq_ + 0.5f), mbps_,
+                                  ffmpegPath_,
+                                  [this](const float* rot, const float* pos, bool key, const uint8_t* au, size_t n) {
+                                      SendVideo(rot, pos, key, au, n);
+                                  });
+        if (ok) SendStreamConfig();
+    }
+    void SendStreamConfig() {
+        if (!sender_) return;
+        uint8_t p[40] = {0};
+        p[0] = 1;   // H.264
+        uint16_t w = (uint16_t)(streamEyeW_ * 2), h = (uint16_t)streamEyeH_;
+        memcpy(p + 4, &w, 2);
+        memcpy(p + 6, &h, 2);
+        {
+            std::lock_guard<std::mutex> g(mu_);
+            memcpy(p + 8, frust_[0], 16);
+            memcpy(p + 24, frust_[1], 16);
+        }
+        sender_(MSG_STREAM_CONFIG, p, 40);
+        Log("sent StreamConfig %ux%u", (unsigned)w, (unsigned)h);
+    }
+    void SendVideo(const float* rot, const float* pos, bool key, const uint8_t* au, size_t n) {
+        if (!sender_) return;
+        std::vector<uint8_t> buf(56 + n);
+        uint32_t seq = ++videoSeq_;
+        uint32_t flags = key ? 1u : 0u;
+        memcpy(buf.data(), &seq, 4);
+        memcpy(buf.data() + 4, &flags, 4);
+        memcpy(buf.data() + 8, rot, 36);
+        memcpy(buf.data() + 44, pos, 12);
+        memcpy(buf.data() + 56, au, n);
+        sender_(MSG_VIDEO, buf.data(), (uint32_t)buf.size());
     }
     void OnPose(const float rot[9], const float pos[3]) {
         float m[3][3];
@@ -379,6 +815,7 @@ public:
     }
 
     void Shutdown() {
+        streamer_.Stop();
         stopVsync_ = true;
         if (vsyncThread_.joinable()) vsyncThread_.join();
     }
@@ -419,10 +856,12 @@ public:
     }
     void DestroySwapTextureSet(SharedTextureHandle_t h) {
         std::lock_guard<std::mutex> g(d3dMu_);
+        streamer_.ForgetTextures();
         swap_.erase((uint64_t)h);
     }
     void DestroyAllSwapTextureSets(uint32_t pid) {
         std::lock_guard<std::mutex> g(d3dMu_);
+        streamer_.ForgetTextures();
         for (auto it = swap_.begin(); it != swap_.end();) {
             if (it->second.pid == pid) it = swap_.erase(it); else ++it;
         }
@@ -434,8 +873,15 @@ public:
         }
     }
     void SubmitLayer(const SubmitLayerPerEye_t (&perEye)[2]) {
-        lastLayer_[0] = perEye[0].hTexture;
-        lastLayer_[1] = perEye[1].hTexture;
+        if (layerCount_++ == 0) {     // the first layer submitted for a frame is the scene; later ones are overlays
+            for (int e = 0; e < 2; e++) {
+                lastLayer_[e] = perEye[e].hTexture;
+                layerBounds_[e] = perEye[e].bounds;
+            }
+            const HmdMatrix34_t& m = perEye[0].mHmdPose;
+            for (int c = 0; c < 3; c++)
+                for (int r = 0; r < 3; r++) layerRot_[c * 3 + r] = m.m[r][c];   // column-major on the wire
+        }
     }
     void Present(SharedTextureHandle_t syncTexture) {
         uint64_t n = ++presented_;
@@ -445,9 +891,18 @@ public:
         std::lock_guard<std::mutex> g(d3dMu_);
         ComPtr<IDXGIKeyedMutex> km = SyncMutex(syncTexture);
         if (km && SUCCEEDED(km->AcquireSync(0, 10))) {
-            // stage 2b: copy both eyes into one frame here, encode it, send it to the phone
+            if (streamer_.Ready() && layerCount_ > 0) {
+                auto a = swap_.find((uint64_t)lastLayer_[0]);
+                auto b = swap_.find((uint64_t)lastLayer_[1]);
+                if (a != swap_.end() && b != swap_.end()) {
+                    const float zeroPos[3] = {0, 0, 0};
+                    streamer_.SubmitFrame(a->second.tex.Get(), layerBounds_[0], b->second.tex.Get(),
+                                          layerBounds_[1], layerRot_, zeroPos);
+                }
+            }
             km->ReleaseSync(0);
         }
+        layerCount_ = 0;
     }
     void PostPresent(const Throttling_t*) {}
     void GetFrameTiming(DriverDirectMode_FrameTiming*) {}
@@ -503,6 +958,14 @@ private:
     std::mutex d3dMu_;
     uint32_t nextIdx_[2] = {0, 0};
     SharedTextureHandle_t lastLayer_[2] = {0, 0};
+    VRTextureBounds_t layerBounds_[2] = {};
+    float layerRot_[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
+    int layerCount_ = 0;
+    Streamer streamer_;
+    std::function<bool(uint16_t, const uint8_t*, uint32_t)> sender_;
+    std::atomic<uint32_t> videoSeq_{0};
+    int streamEyeW_ = 1280, streamEyeH_ = 1280, mbps_ = 40;
+    std::string ffmpegPath_;
     std::atomic<uint64_t> presented_{0};
     std::thread vsyncThread_;
     std::atomic<bool> stopVsync_{false};
@@ -574,6 +1037,14 @@ private:
         return true;
     }
 
+public:
+    bool Send(uint16_t type, const uint8_t* payload, uint32_t len) {
+        SOCKET s = sock_;
+        if (s == INVALID_SOCKET) return false;
+        return SendMsg(s, type, payload, len);
+    }
+
+private:
     bool SendMsg(SOCKET s, uint16_t type, const uint8_t* payload, uint32_t len) {
         uint8_t hdr[12];
         uint16_t zero = 0;
@@ -605,6 +1076,7 @@ private:
                 memcpy(fl, payload.data() + 28, 16);
                 memcpy(fr, payload.data() + 44, 16);
                 hmd_->OnHello(fl, fr);
+                hmd_->OnPhoneReady();
                 Log("phone hello: left eye frustum l=%.2f r=%.2f u=%.2f d=%.2f", fl[0], fl[1], fl[2], fl[3]);
             } else if (type == MSG_POSE && len >= 64) {
                 float rot[9], pos[3];
@@ -669,6 +1141,7 @@ public:
         Log("TrackedDeviceAdded returned %d", added ? 1 : 0);
         std::string host = SettingS("phoneAddress", "172.20.10.1");
         int port = SettingI("phonePort", 9000);
+        hmd_->SetSender([this](uint16_t t, const uint8_t* p, uint32_t n) { return net_.Send(t, p, n); });
         net_.Start(host, (uint16_t)port, hmd_);
         Log("Provider::Init done");
         return VRInitError_None;

@@ -14,6 +14,10 @@
     "ipd": 0.064,
     "secondsFromVsyncToPhotons": 0.011,
     "headHeight": 1.6,
-    "fovTan": 1.2
+    "fovTan": 1.2,
+    "streamEyeWidth": 1280,
+    "streamEyeHeight": 1280,
+    "bitrateMbps": 40,
+    "ffmpegPath": "auto"
   }
 }
