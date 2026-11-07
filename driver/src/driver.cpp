@@ -1019,7 +1019,105 @@ private:
         for (int i = 0; i < ms / 50 && !stop_; i++) std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
 
+    // ---- USB path: ask Apple's USB service (usbmuxd, 127.0.0.1:27015) for a tunnel to the phone app.
+    void UsbNote(const std::string& m) {
+        if (m != lastUsbNote_) { lastUsbNote_ = m; Log("%s", m.c_str()); }
+    }
+
+    static long ParseInt(const std::string& x, const char* key) {
+        std::string k = std::string("<key>") + key + "</key>";
+        size_t p = x.find(k);
+        if (p == std::string::npos) return -1;
+        p = x.find("<integer>", p + k.size());
+        if (p == std::string::npos) return -1;
+        return atol(x.c_str() + p + 9);
+    }
+
+    static bool MuxRequest(SOCKET s, const char* type, long deviceId, uint32_t tag, int port, std::string& resp) {
+        std::string xml =
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+            "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
+            "<plist version=\"1.0\"><dict>"
+            "<key>ClientVersionString</key><string>opencardboard</string>"
+            "<key>MessageType</key><string>" + std::string(type) + "</string>"
+            "<key>ProgName</key><string>opencardboard</string>";
+        if (deviceId >= 0) {
+            xml += "<key>DeviceID</key><integer>" + std::to_string(deviceId) + "</integer>"
+                   "<key>PortNumber</key><integer>" + std::to_string((int)htons((u_short)port)) + "</integer>";
+        }
+        xml += "</dict></plist>";
+        uint32_t hdr[4] = {(uint32_t)(16 + xml.size()), 1, 8, tag};
+        if (send(s, (const char*)hdr, 16, 0) != 16) return false;
+        if (send(s, xml.data(), (int)xml.size(), 0) != (int)xml.size()) return false;
+        uint32_t rh[4];
+        if (!RecvAll(s, (uint8_t*)rh, 16)) return false;
+        uint32_t len = rh[0];
+        if (len < 16 || len > (1u << 20)) return false;
+        resp.assign(len - 16, '\0');
+        if (len > 16 && !RecvAll(s, (uint8_t*)&resp[0], (int)(len - 16))) return false;
+        return true;
+    }
+
+    SOCKET MuxSocket() {
+        SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (s == INVALID_SOCKET) return s;
+        sockaddr_in a = {};
+        a.sin_family = AF_INET;
+        a.sin_port = htons(27015);
+        inet_pton(AF_INET, "127.0.0.1", &a.sin_addr);
+        DWORD to = 3000;
+        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&to, sizeof(to));
+        setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char*)&to, sizeof(to));
+        if (connect(s, (sockaddr*)&a, sizeof(a)) != 0) { closesocket(s); return INVALID_SOCKET; }
+        return s;
+    }
+
+    SOCKET ConnectUsb() {
+        SOCKET s = MuxSocket();
+        if (s == INVALID_SOCKET) { UsbNote("usb: Apple's USB service is not reachable (127.0.0.1:27015)"); return s; }
+        std::string resp;
+        if (!MuxRequest(s, "ListDevices", -1, 1, resp)) {
+            closesocket(s);
+            UsbNote("usb: no usable reply to ListDevices");
+            return INVALID_SOCKET;
+        }
+        closesocket(s);
+        long id = ParseInt(resp, "DeviceID");
+        if (id < 0) { UsbNote("usb: no iPhone attached"); return INVALID_SOCKET; }
+
+        SOCKET s2 = MuxSocket();
+        if (s2 == INVALID_SOCKET) return s2;
+        if (!MuxRequest(s2, "Connect", id, 2, (int)port_, resp)) {
+            closesocket(s2);
+            UsbNote("usb: no usable reply to Connect");
+            return INVALID_SOCKET;
+        }
+        long code = ParseInt(resp, "Number");
+        if (code != 0) {
+            closesocket(s2);
+            char note[160];
+            snprintf(note, sizeof(note), "usb: iPhone found (id %ld) but connecting to the app failed (code %ld) - is OpenCardboard open?", id, code);
+            UsbNote(note);
+            return INVALID_SOCKET;
+        }
+        int one = 1;
+        setsockopt(s2, IPPROTO_TCP, TCP_NODELAY, (const char*)&one, sizeof(one));
+        DWORD to = 3000;
+        setsockopt(s2, SOL_SOCKET, SO_RCVTIMEO, (const char*)&to, sizeof(to));
+        UsbNote("usb: connected through the USB cable (no hotspot needed)");
+        return s2;
+    }
+
     SOCKET Connect() {
+        if (transport_ != "network") {
+            SOCKET u = ConnectUsb();
+            if (u != INVALID_SOCKET) return u;
+        }
+        if (transport_ == "usb") return INVALID_SOCKET;
+        return ConnectTcp();
+    }
+
+    SOCKET ConnectTcp() {
         SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         if (s == INVALID_SOCKET) return s;
         sockaddr_in a = {};
@@ -1056,6 +1154,7 @@ private:
     }
 
 public:
+    void SetTransport(const std::string& t) { transport_ = t; }
     bool Send(uint16_t type, const uint8_t* payload, uint32_t len) {
         SOCKET s = sock_;
         if (s == INVALID_SOCKET) return false;
@@ -1145,6 +1244,8 @@ private:
     }
 
     std::string host_;
+    std::string transport_ = "auto";      // "auto" = USB cable first, then the network address; "usb"; "network"
+    std::string lastUsbNote_;
     uint16_t port_ = 9000;
     HmdDevice* hmd_ = nullptr;
     std::atomic<bool> stop_{false};
@@ -1169,6 +1270,7 @@ public:
         std::string host = SettingS("phoneAddress", "172.20.10.1");
         int port = SettingI("phonePort", 9000);
         hmd_->SetSender([this](uint16_t t, const uint8_t* p, uint32_t n) { return net_.Send(t, p, n); });
+        net_.SetTransport(SettingS("phoneTransport", "auto"));
         net_.Start(host, (uint16_t)port, hmd_);
         Log("Provider::Init done");
         return VRInitError_None;
