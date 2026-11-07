@@ -25,6 +25,7 @@
 #include <algorithm>
 #include <map>
 #include <d3d11.h>
+#include <d3d11_4.h>
 #include <d3dcompiler.h>
 #include <condition_variable>
 #include <deque>
