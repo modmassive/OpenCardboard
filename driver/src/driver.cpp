@@ -651,12 +651,12 @@ public:
                                           "{htc}/input/vive_controller_profile.json");
         VRProperties()->SetStringProperty(c, Prop_RenderModelName_String, "vr_controller_vive_1_5");
         VRProperties()->SetInt32Property(c, Prop_ControllerRoleHint_Int32, TrackedControllerRole_RightHand);
-        VRInputError e1 = VRDriverInput()->CreateBooleanComponent(c, "/input/trigger/click", &hTrigClick_);
-        VRInputError e2 = VRDriverInput()->CreateScalarComponent(c, "/input/trigger/value", &hTrigVal_,
+        EVRInputError e1 = VRDriverInput()->CreateBooleanComponent(c, "/input/trigger/click", &hTrigClick_);
+        EVRInputError e2 = VRDriverInput()->CreateScalarComponent(c, "/input/trigger/value", &hTrigVal_,
                                                                   VRScalarType_Absolute, VRScalarUnits_NormalizedOneSided);
-        VRInputError e3 = VRDriverInput()->CreateBooleanComponent(c, "/input/system/click", &hSystem_);
-        VRInputError e4 = VRDriverInput()->CreateBooleanComponent(c, "/input/application_menu/click", &hMenu_);
-        VRInputError e5 = VRDriverInput()->CreateBooleanComponent(c, "/input/grip/click", &hGrip_);
+        EVRInputError e3 = VRDriverInput()->CreateBooleanComponent(c, "/input/system/click", &hSystem_);
+        EVRInputError e4 = VRDriverInput()->CreateBooleanComponent(c, "/input/application_menu/click", &hMenu_);
+        EVRInputError e5 = VRDriverInput()->CreateBooleanComponent(c, "/input/grip/click", &hGrip_);
         Log("gaze pointer activated (object id %u); component results %d %d %d %d %d", id,
             (int)e1, (int)e2, (int)e3, (int)e4, (int)e5);
         if (!poll_.joinable()) {
