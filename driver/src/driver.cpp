@@ -617,6 +617,20 @@ private:
     std::atomic<bool> ready_{false};
 };
 
+HmdQuaternion_t QMul(const HmdQuaternion_t& a, const HmdQuaternion_t& b) {
+    HmdQuaternion_t r;
+    r.w = a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z;
+    r.x = a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y;
+    r.y = a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x;
+    r.z = a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w;
+    return r;
+}
+HmdQuaternion_t QConj(const HmdQuaternion_t& a) {
+    HmdQuaternion_t r;
+    r.w = a.w; r.x = -a.x; r.y = -a.y; r.z = -a.z;
+    return r;
+}
+
 // ---------------------------------------------------------------- gamepad bridge: a gaze-pointing virtual controller
 // SteamVR's menus are operated with a laser pointer + trigger. This device sits in front of the headset,
 // pointing where you look, and takes its buttons from an Xbox-style controller connected to the PC:
@@ -709,24 +723,39 @@ private:
     void PollLoop() {
         bool lTrig = false, lSys = false, lMenu = false, lGrip = false;
         float lVal = -1.0f;
+        DWORD lSlots = 0xFFFFFFFFu;
+        WORD lButtons = 0;
+        BYTE lRt = 0;
         while (!stop_) {
-            XINPUT_STATE st;
-            bool have = false;
-            for (DWORD i = 0; i < 4 && !have; i++) {
+            WORD b = 0;
+            BYTE rt = 0;
+            DWORD slots = 0;
+            for (DWORD i = 0; i < 4; i++) {
+                XINPUT_STATE st;
                 ZeroMemory(&st, sizeof(st));
-                if (XInputGetState(i, &st) == ERROR_SUCCESS) have = true;
+                if (XInputGetState(i, &st) == ERROR_SUCCESS) {
+                    slots |= (1u << i);
+                    b |= st.Gamepad.wButtons;
+                    if (st.Gamepad.bRightTrigger > rt) rt = st.Gamepad.bRightTrigger;
+                }
             }
-            bool trig = false, sys = false, menu = false, grip = false;
-            float val = 0.0f;
-            if (have) {
-                WORD b = st.Gamepad.wButtons;
-                val = st.Gamepad.bRightTrigger / 255.0f;
-                trig = (b & XINPUT_GAMEPAD_A) || val > 0.5f;
-                sys = (b & XINPUT_GAMEPAD_BACK) != 0;
-                menu = (b & XINPUT_GAMEPAD_START) != 0;
-                grip = (b & XINPUT_GAMEPAD_RIGHT_SHOULDER) != 0;
-                if (trig && val < 0.5f) val = 1.0f;
+            if (slots != lSlots) {
+                lSlots = slots;
+                Log("pad: XInput controller slots connected: 0x%lX (0 = none visible to SteamVR)", (unsigned long)slots);
             }
+            if (b != lButtons || (rt > 100) != (lRt > 100)) {
+                lButtons = b;
+                lRt = rt;
+                Log("pad: XInput buttons 0x%04X, right trigger %u", (unsigned)b, (unsigned)rt);
+            }
+
+            float val = rt / 255.0f;
+            bool trig = (b & XINPUT_GAMEPAD_A) || val > 0.5f;
+            bool sys = (b & XINPUT_GAMEPAD_BACK) != 0;
+            bool menu = (b & XINPUT_GAMEPAD_START) != 0;
+            bool grip = (b & XINPUT_GAMEPAD_RIGHT_SHOULDER) != 0;
+            if (trig && val < 0.5f) val = 1.0f;
+
             if (id_ != k_unTrackedDeviceIndexInvalid) {
                 if (trig != lTrig) { VRDriverInput()->UpdateBooleanComponent(hTrigClick_, trig, 0.0); lTrig = trig; Log("pad: trigger %s", trig ? "down" : "up"); }
                 if (val != lVal)   { VRDriverInput()->UpdateScalarComponent(hTrigVal_, val, 0.0); lVal = val; }
@@ -768,7 +797,7 @@ public:
         renderH_ = SettingI("renderHeight", 640);
         freq_ = SettingF("displayFrequency", 60.0f);
         ipd_ = SettingF("ipd", 0.064f);
-        photons_ = SettingF("secondsFromVsyncToPhotons", 0.011f);
+        photons_ = SettingF("secondsFromVsyncToPhotons", 0.011f) + SettingF("predictionMs", 40.0f) / 1000.0f;
         headHeight_ = SettingF("headHeight", 1.6f);
         streamEyeW_ = SettingI("streamEyeWidth", 1280);
         streamEyeH_ = SettingI("streamEyeHeight", 1280);
@@ -865,6 +894,11 @@ public:
         { std::lock_guard<std::mutex> g(mu_); connected_ = c; }
         if (!c) {
             streamer_.Stop();
+            {
+                std::lock_guard<std::mutex> g(mu_);
+                havePrev_ = false;
+                for (int i = 0; i < 3; i++) angVel_[i] = 0.0;
+            }
             if (pad_) { double pp[3] = {0, headHeight_, 0}; pad_->SetHmdPose(q_, pp, false); }
         }
         PushPose();
@@ -926,10 +960,30 @@ public:
         for (int c = 0; c < 3; c++)
             for (int r = 0; r < 3; r++) m[r][c] = rot[c * 3 + r];   // column-major on the wire
         HmdQuaternion_t q = QuatFromMatrix(m);
+        auto now = std::chrono::steady_clock::now();
+        double w3[3] = {0, 0, 0};
+        if (havePrev_) {
+            double dt = std::chrono::duration<double>(now - prevT_).count();
+            if (dt > 0.001 && dt < 0.1) {
+                HmdQuaternion_t d = QMul(q, QConj(prevQ_));      // world-frame rotation since the last sample
+                if (d.w < 0) { d.w = -d.w; d.x = -d.x; d.y = -d.y; d.z = -d.z; }
+                double sn = std::sqrt(d.x * d.x + d.y * d.y + d.z * d.z);
+                if (sn > 1e-9) {
+                    double k = 2.0 * std::atan2(sn, d.w) / sn / dt;
+                    w3[0] = d.x * k; w3[1] = d.y * k; w3[2] = d.z * k;
+                }
+            }
+        }
+        prevQ_ = q;
+        prevT_ = now;
+        havePrev_ = true;
         {
             std::lock_guard<std::mutex> g(mu_);
             q_ = q;
-            for (int i = 0; i < 3; i++) pos_[i] = pos[i];
+            for (int i = 0; i < 3; i++) {
+                pos_[i] = pos[i];
+                angVel_[i] = 0.5 * angVel_[i] + 0.5 * w3[i];     // light smoothing
+            }
         }
         if (pad_) {
             double pp[3] = {pos[0], headHeight_ + pos[1], pos[2]};
@@ -1092,6 +1146,7 @@ private:
         p.poseIsValid = connected_;
         p.deviceIsConnected = connected_;
         p.result = connected_ ? TrackingResult_Running_OK : TrackingResult_Uninitialized;
+        for (int i = 0; i < 3; i++) p.vecAngularVelocity[i] = connected_ ? angVel_[i] : 0.0;
         p.shouldApplyHeadModel = false;
         p.willDriftInYaw = true;
         return p;
@@ -1136,6 +1191,10 @@ private:
     std::atomic<uint32_t> videoSeq_{0};
     std::atomic<bool> d3dReady_{false};
     PadDevice* pad_ = nullptr;
+    HmdQuaternion_t prevQ_ = {1, 0, 0, 0};
+    std::chrono::steady_clock::time_point prevT_;
+    bool havePrev_ = false;
+    double angVel_[3] = {0, 0, 0};
     PropertyContainerHandle_t props_ = k_ulInvalidPropertyContainer;
     std::string encoderPreset_;
     int streamEyeW_ = 1280, streamEyeH_ = 1280, mbps_ = 40;
