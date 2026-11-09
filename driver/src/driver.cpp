@@ -663,7 +663,13 @@ public:
         VRProperties()->SetStringProperty(c, Prop_ControllerType_String, "vive_controller");
         VRProperties()->SetStringProperty(c, Prop_InputProfilePath_String,
                                           "{htc}/input/vive_controller_profile.json");
-        VRProperties()->SetStringProperty(c, Prop_RenderModelName_String, "vr_controller_vive_1_5");
+        std::string padModel = SettingS("padModel", "hidden");
+        if (padModel == "default")
+            VRProperties()->SetStringProperty(c, Prop_RenderModelName_String, "vr_controller_vive_1_5");
+        else if (padModel == "hidden")
+            VRProperties()->SetStringProperty(c, Prop_RenderModelName_String, "opencardboard_no_model");
+        // "unset": leave the render model property out
+        Log("gaze pointer model mode: %s", padModel.c_str());
         VRProperties()->SetInt32Property(c, Prop_ControllerRoleHint_Int32, TrackedControllerRole_RightHand);
         EVRInputError e1 = VRDriverInput()->CreateBooleanComponent(c, "/input/trigger/click", &hTrigClick_);
         EVRInputError e2 = VRDriverInput()->CreateScalarComponent(c, "/input/trigger/value", &hTrigVal_,
