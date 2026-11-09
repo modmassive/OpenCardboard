@@ -670,6 +670,13 @@ public:
             VRProperties()->SetStringProperty(c, Prop_RenderModelName_String, "opencardboard_no_model");
         // "unset": leave the render model property out
         Log("gaze pointer model mode: %s", padModel.c_str());
+        std::string rb = SettingS("recenterButton", "lthumb");
+        recenterMask_ = rb == "rthumb" ? XINPUT_GAMEPAD_RIGHT_THUMB
+                      : rb == "y"      ? XINPUT_GAMEPAD_Y
+                      : rb == "x"      ? XINPUT_GAMEPAD_X
+                      : rb == "none"   ? 0
+                                       : XINPUT_GAMEPAD_LEFT_THUMB;
+        Log("recenter button: %s", rb.c_str());
         VRProperties()->SetInt32Property(c, Prop_ControllerRoleHint_Int32, TrackedControllerRole_RightHand);
         EVRInputError e1 = VRDriverInput()->CreateBooleanComponent(c, "/input/trigger/click", &hTrigClick_);
         EVRInputError e2 = VRDriverInput()->CreateScalarComponent(c, "/input/trigger/value", &hTrigVal_,
@@ -695,6 +702,8 @@ public:
         stop_ = true;
         if (poll_.joinable()) poll_.join();
     }
+
+    void SetRecenter(std::function<void()> f) { onRecenter_ = f; }
 
     void SetHmdPose(const HmdQuaternion_t& q, const double pos[3], bool connected) {
         {
@@ -727,7 +736,7 @@ private:
     }
 
     void PollLoop() {
-        bool lTrig = false, lSys = false, lMenu = false, lGrip = false;
+        bool lTrig = false, lSys = false, lMenu = false, lGrip = false, lRc = false;
         float lVal = -1.0f;
         DWORD lSlots = 0xFFFFFFFFu;
         WORD lButtons = 0;
@@ -762,6 +771,10 @@ private:
             bool grip = (b & XINPUT_GAMEPAD_RIGHT_SHOULDER) != 0;
             if (trig && val < 0.5f) val = 1.0f;
 
+            bool rc = recenterMask_ != 0 && (b & recenterMask_) != 0;
+            if (rc && !lRc && onRecenter_) { Log("pad: recenter button pressed"); onRecenter_(); }
+            lRc = rc;
+
             if (id_ != k_unTrackedDeviceIndexInvalid) {
                 if (trig != lTrig) { VRDriverInput()->UpdateBooleanComponent(hTrigClick_, trig, 0.0); lTrig = trig; Log("pad: trigger %s", trig ? "down" : "up"); }
                 if (val != lVal)   { VRDriverInput()->UpdateScalarComponent(hTrigVal_, val, 0.0); lVal = val; }
@@ -773,6 +786,8 @@ private:
         }
     }
 
+    std::function<void()> onRecenter_;
+    WORD recenterMask_ = XINPUT_GAMEPAD_LEFT_THUMB;
     std::atomic<uint32_t> id_{k_unTrackedDeviceIndexInvalid};
     VRInputComponentHandle_t hTrigClick_ = k_ulInvalidInputComponentHandle;
     VRInputComponentHandle_t hTrigVal_ = k_ulInvalidInputComponentHandle;
@@ -805,6 +820,10 @@ public:
         ipd_ = SettingF("ipd", 0.064f);
         photons_ = SettingF("secondsFromVsyncToPhotons", 0.011f) + SettingF("predictionMs", 40.0f) / 1000.0f;
         headHeight_ = SettingF("headHeight", 1.6f);
+        velSmoothMs_ = SettingF("velocitySmoothingMs", 50.0f);
+        velDeadLow_ = SettingF("velocityDeadzoneLow", 0.08f);
+        velDeadHigh_ = SettingF("velocityDeadzoneHigh", 0.40f);
+        sendAngVel_ = SettingB("sendAngularVelocity", true);
         streamEyeW_ = SettingI("streamEyeWidth", 1280);
         streamEyeH_ = SettingI("streamEyeHeight", 1280);
         mbps_ = SettingI("bitrateMbps", 40);
@@ -961,15 +980,58 @@ public:
         memcpy(buf.data() + 56, au, n);
         sender_(MSG_VIDEO, buf.data(), (uint32_t)buf.size());
     }
+    void RequestRecenter() {
+        std::lock_guard<std::mutex> g(mu_);
+        recenterRequested_ = true;
+    }
+
     void OnPose(const float rot[9], const float pos[3]) {
         float m[3][3];
         for (int c = 0; c < 3; c++)
             for (int r = 0; r < 3; r++) m[r][c] = rot[c * 3 + r];   // column-major on the wire
-        HmdQuaternion_t q = QuatFromMatrix(m);
+        HmdQuaternion_t qRaw = QuatFromMatrix(m);
+
+        HmdQuaternion_t q;
+        bool yawChanged = false;
+        {
+            std::lock_guard<std::mutex> g(mu_);
+            if (recenterRequested_) {
+                recenterRequested_ = false;
+                recentering_ = true;
+                recenterSamples_ = 0;
+                recenterFx_ = recenterFz_ = 0.0;
+            }
+            if (recentering_) {
+                // average where the head points for about a quarter of a second, then zero the yaw
+                double f[3];
+                RotateVec(QMul(yawQ_, qRaw), 0.0, 0.0, -1.0, f);
+                recenterFx_ += f[0];
+                recenterFz_ += f[2];
+                if (++recenterSamples_ >= 30) {
+                    recentering_ = false;
+                    double horiz = std::sqrt(recenterFx_ * recenterFx_ + recenterFz_ * recenterFz_);
+                    if (horiz > 0.3 * recenterSamples_) {
+                        double psi = std::atan2(recenterFx_, -recenterFz_);
+                        yawAngle_ += psi;
+                        yawQ_.w = std::cos(yawAngle_ * 0.5);
+                        yawQ_.x = 0.0;
+                        yawQ_.y = std::sin(yawAngle_ * 0.5);
+                        yawQ_.z = 0.0;
+                        yawChanged = true;
+                        Log("recentered (yaw changed by %.1f degrees)", psi * 57.29578);
+                    } else {
+                        Log("recenter skipped: looking too far up or down");
+                    }
+                }
+            }
+            q = QMul(yawQ_, qRaw);
+        }
+
         auto now = std::chrono::steady_clock::now();
         double w3[3] = {0, 0, 0};
-        if (havePrev_) {
-            double dt = std::chrono::duration<double>(now - prevT_).count();
+        double dt = 0.0;
+        if (havePrev_ && !yawChanged) {
+            dt = std::chrono::duration<double>(now - prevT_).count();
             if (dt > 0.001 && dt < 0.1) {
                 HmdQuaternion_t d = QMul(q, QConj(prevQ_));      // world-frame rotation since the last sample
                 if (d.w < 0) { d.w = -d.w; d.x = -d.x; d.y = -d.y; d.z = -d.z; }
@@ -978,17 +1040,22 @@ public:
                     double k = 2.0 * std::atan2(sn, d.w) / sn / dt;
                     w3[0] = d.x * k; w3[1] = d.y * k; w3[2] = d.z * k;
                 }
+            } else {
+                dt = 0.0;
             }
         }
         prevQ_ = q;
         prevT_ = now;
-        havePrev_ = true;
+        havePrev_ = !yawChanged;
         {
             std::lock_guard<std::mutex> g(mu_);
             q_ = q;
-            for (int i = 0; i < 3; i++) {
-                pos_[i] = pos[i];
-                angVel_[i] = 0.5 * angVel_[i] + 0.5 * w3[i];     // light smoothing
+            for (int i = 0; i < 3; i++) pos_[i] = pos[i];
+            if (dt > 0.0) {
+                double a = dt / (velSmoothMs_ / 1000.0 + dt);     // time-based smoothing
+                for (int i = 0; i < 3; i++) angVel_[i] += a * (w3[i] - angVel_[i]);
+            } else if (yawChanged) {
+                for (int i = 0; i < 3; i++) angVel_[i] = 0.0;
             }
         }
         if (pad_) {
@@ -1152,7 +1219,17 @@ private:
         p.poseIsValid = connected_;
         p.deviceIsConnected = connected_;
         p.result = connected_ ? TrackingResult_Running_OK : TrackingResult_Uninitialized;
-        for (int i = 0; i < 3; i++) p.vecAngularVelocity[i] = connected_ ? angVel_[i] : 0.0;
+        {
+            double mag = std::sqrt(angVel_[0] * angVel_[0] + angVel_[1] * angVel_[1] + angVel_[2] * angVel_[2]);
+            double scale = 0.0;
+            if (sendAngVel_ && connected_ && mag > 1e-9) {
+                double span = std::max(1e-6, (double)(velDeadHigh_ - velDeadLow_));
+                double t = std::min(1.0, std::max(0.0, (mag - velDeadLow_) / span));
+                scale = t * t * (3.0 - 2.0 * t);                   // ignore tiny turns, pass real ones
+                if (mag > 12.0) scale *= 12.0 / mag;
+            }
+            for (int i = 0; i < 3; i++) p.vecAngularVelocity[i] = angVel_[i] * scale;
+        }
         p.shouldApplyHeadModel = false;
         p.willDriftInYaw = true;
         return p;
@@ -1201,6 +1278,13 @@ private:
     std::chrono::steady_clock::time_point prevT_;
     bool havePrev_ = false;
     double angVel_[3] = {0, 0, 0};
+    float velSmoothMs_ = 50.0f, velDeadLow_ = 0.08f, velDeadHigh_ = 0.40f;
+    bool sendAngVel_ = true;
+    HmdQuaternion_t yawQ_ = {1, 0, 0, 0};
+    double yawAngle_ = 0.0;
+    bool recenterRequested_ = false, recentering_ = false;
+    int recenterSamples_ = 0;
+    double recenterFx_ = 0.0, recenterFz_ = 0.0;
     PropertyContainerHandle_t props_ = k_ulInvalidPropertyContainer;
     std::string encoderPreset_;
     int streamEyeW_ = 1280, streamEyeH_ = 1280, mbps_ = 40;
@@ -1495,6 +1579,7 @@ public:
             bool added = VRServerDriverHost()->TrackedDeviceAdded(pad_->Serial(), TrackedDeviceClass_Controller, pad_);
             Log("gaze pointer added: %d", added ? 1 : 0);
             hmd_->SetPad(pad_);
+            pad_->SetRecenter([this] { if (hmd_) hmd_->RequestRecenter(); });
         }
         hmd_->SetSender([this](uint16_t t, const uint8_t* p, uint32_t n) { return net_.Send(t, p, n); });
         net_.SetTransport(SettingS("phoneTransport", "auto"));
