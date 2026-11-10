@@ -330,6 +330,19 @@ public:
         rd.DepthClipEnable = TRUE;
         if (FAILED(dev_->CreateRasterizerState(&rd, &rs_))) return false;
 
+        D3D11_BLEND_DESC bld = {};
+        bld.RenderTarget[0].BlendEnable = FALSE;
+        bld.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+        if (FAILED(dev_->CreateBlendState(&bld, &blendOpaque_))) return false;
+        bld.RenderTarget[0].BlendEnable = TRUE;
+        bld.RenderTarget[0].SrcBlend = D3D11_BLEND_SRC_ALPHA;
+        bld.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+        bld.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+        bld.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+        bld.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
+        bld.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+        if (FAILED(dev_->CreateBlendState(&bld, &blendAlpha_))) return false;
+
         D3D11_TEXTURE2D_DESC td = {};
         td.Width = (UINT)(eyeW * 2);
         td.Height = (UINT)eyeH;
@@ -371,12 +384,15 @@ public:
 
     void ForgetTextures() { srvCache_.clear(); }
 
-    // called from Present() while the compositor's sync mutex is held
-    void SubmitFrame(ID3D11Texture2D* left, const VRTextureBounds_t& bl,
-                     ID3D11Texture2D* right, const VRTextureBounds_t& br,
-                     const float rot[9], const float pos[3]) {
+    struct LayerRef {
+        ID3D11Texture2D* tex[2];
+        VRTextureBounds_t b[2];
+    };
+
+    // called from Present() while the compositor's sync mutex is held; layers are drawn in order, back to front
+    void SubmitFrame(const LayerRef* layers, int count, const float rot[9], const float pos[3]) {
         std::unique_lock<std::mutex> life(lifeMu_, std::try_to_lock);
-        if (!life.owns_lock() || !ready_) return;
+        if (!life.owns_lock() || !ready_ || count <= 0) return;
         int slot;
         {
             std::lock_guard<std::mutex> g(qmu_);
@@ -385,8 +401,15 @@ public:
             writeIdx_ = (writeIdx_ + 1) % kRing;
             inflight_++;
         }
-        ComPtr<ID3D11ShaderResourceView> sl = Srv(left), sr = Srv(right);
-        if (!sl || !sr) {
+        std::vector<ComPtr<ID3D11ShaderResourceView>> srvs((size_t)count * 2);
+        bool ok = true;
+        for (int l = 0; l < count && ok; l++) {
+            for (int e = 0; e < 2; e++) {
+                srvs[(size_t)l * 2 + e] = Srv(layers[l].tex[e]);
+                if (!srvs[(size_t)l * 2 + e]) ok = false;
+            }
+        }
+        if (!ok) {
             std::lock_guard<std::mutex> g(qmu_);
             inflight_--;
             writeIdx_ = (writeIdx_ + kRing - 1) % kRing;
@@ -394,6 +417,8 @@ public:
         }
 
         ctx_->OMSetRenderTargets(1, rtv_.GetAddressOf(), nullptr);
+        const float black[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+        ctx_->ClearRenderTargetView(rtv_.Get(), black);
         ctx_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         ctx_->IASetInputLayout(nullptr);
         ctx_->VSSetShader(vs_.Get(), nullptr, 0);
@@ -404,15 +429,19 @@ public:
         for (int e = 0; e < 2; e++) {
             D3D11_VIEWPORT vp = {(float)(e * eyeW_), 0.0f, (float)eyeW_, (float)eyeH_, 0.0f, 1.0f};
             ctx_->RSSetViewports(1, &vp);
-            const VRTextureBounds_t& b = (e == 0) ? bl : br;
-            float cbv[4] = {b.uMin, b.vMin, b.uMax, b.vMax};
-            ctx_->UpdateSubresource(cb_buf_.Get(), 0, nullptr, cbv, 0, 0);
-            ID3D11ShaderResourceView* srv = (e == 0) ? sl.Get() : sr.Get();
-            ctx_->PSSetShaderResources(0, 1, &srv);
-            ctx_->Draw(3, 0);
+            for (int l = 0; l < count; l++) {
+                const VRTextureBounds_t& b = layers[l].b[e];
+                float cbv[4] = {b.uMin, b.vMin, b.uMax, b.vMax};
+                ctx_->UpdateSubresource(cb_buf_.Get(), 0, nullptr, cbv, 0, 0);
+                ctx_->OMSetBlendState(l == 0 ? blendOpaque_.Get() : blendAlpha_.Get(), nullptr, 0xFFFFFFFFu);
+                ID3D11ShaderResourceView* sv = srvs[(size_t)l * 2 + e].Get();
+                ctx_->PSSetShaderResources(0, 1, &sv);
+                ctx_->Draw(3, 0);
+            }
         }
         ID3D11ShaderResourceView* nullSrv = nullptr;
         ctx_->PSSetShaderResources(0, 1, &nullSrv);
+        ctx_->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFFu);
         ID3D11RenderTargetView* nullRtv = nullptr;
         ctx_->OMSetRenderTargets(1, &nullRtv, nullptr);
         ctx_->CopyResource(stage_[slot].Get(), out_.Get());
@@ -597,6 +626,7 @@ private:
     ComPtr<ID3D11Buffer> cb_buf_;
     ComPtr<ID3D11SamplerState> smp_;
     ComPtr<ID3D11RasterizerState> rs_;
+    ComPtr<ID3D11BlendState> blendOpaque_, blendAlpha_;
     ComPtr<ID3D11Texture2D> out_;
     ComPtr<ID3D11RenderTargetView> rtv_;
     ComPtr<ID3D11Texture2D> stage_[kRing];
@@ -1170,16 +1200,43 @@ public:
         }
     }
     void SubmitLayer(const SubmitLayerPerEye_t (&perEye)[2]) {
-        if (layerCount_++ == 0) {     // the first layer submitted for a frame is the scene; later ones are overlays
+        int n = layerCount_++;
+        if (n < kMaxLayers) {
             for (int e = 0; e < 2; e++) {
-                lastLayer_[e] = perEye[e].hTexture;
-                layerBounds_[e] = perEye[e].bounds;
+                layers_[n].h[e] = perEye[e].hTexture;
+                layers_[n].b[e] = perEye[e].bounds;
             }
+        }
+        if (n == 0) {     // the first layer's pose is what the phone uses for its head-turn correction
             const HmdMatrix34_t& m = perEye[0].mHmdPose;
             for (int c = 0; c < 3; c++)
                 for (int r = 0; r < 3; r++) layerRot_[c * 3 + r] = m.m[r][c];   // column-major on the wire
         }
     }
+
+    // Log whenever the arrangement of layers changes (count, sizes, bounds), so we can see what SteamVR sends.
+    void LogLayers(int count) {
+        std::string sig = std::to_string(layerCount_) + " layer(s):";
+        for (int i = 0; i < count; i++) {
+            auto it = swap_.find((uint64_t)layers_[i].h[0]);
+            char buf[160];
+            if (it != swap_.end()) {
+                D3D11_TEXTURE2D_DESC d;
+                it->second.tex->GetDesc(&d);
+                snprintf(buf, sizeof(buf), " [%d: %ux%u fmt %u pid %u bounds %.2f %.2f %.2f %.2f]", i, d.Width, d.Height,
+                         (unsigned)d.Format, it->second.pid, layers_[i].b[0].uMin, layers_[i].b[0].vMin,
+                         layers_[i].b[0].uMax, layers_[i].b[0].vMax);
+            } else {
+                snprintf(buf, sizeof(buf), " [%d: unknown texture]", i);
+            }
+            sig += buf;
+        }
+        if (sig != lastLayerSig_) {
+            lastLayerSig_ = sig;
+            Log("frame layout: %s", sig.c_str());
+        }
+    }
+
     void Present(SharedTextureHandle_t syncTexture) {
         uint64_t n = ++presented_;
         if (n == 1 || n % 300 == 0) {
@@ -1188,13 +1245,24 @@ public:
         std::lock_guard<std::mutex> g(d3dMu_);
         ComPtr<IDXGIKeyedMutex> km = SyncMutex(syncTexture);
         if (km && SUCCEEDED(km->AcquireSync(0, 10))) {
-            if (streamer_.Ready() && layerCount_ > 0) {
-                auto a = swap_.find((uint64_t)lastLayer_[0]);
-                auto b = swap_.find((uint64_t)lastLayer_[1]);
-                if (a != swap_.end() && b != swap_.end()) {
+            int count = std::min(layerCount_, kMaxLayers);
+            LogLayers(count);
+            if (streamer_.Ready() && count > 0) {
+                Streamer::LayerRef refs[kMaxLayers];
+                int used = 0;
+                for (int i = 0; i < count; i++) {
+                    auto a = swap_.find((uint64_t)layers_[i].h[0]);
+                    auto b = swap_.find((uint64_t)layers_[i].h[1]);
+                    if (a == swap_.end() || b == swap_.end()) continue;
+                    refs[used].tex[0] = a->second.tex.Get();
+                    refs[used].tex[1] = b->second.tex.Get();
+                    refs[used].b[0] = layers_[i].b[0];
+                    refs[used].b[1] = layers_[i].b[1];
+                    used++;
+                }
+                if (used > 0) {
                     const float zeroPos[3] = {0, 0, 0};
-                    streamer_.SubmitFrame(a->second.tex.Get(), layerBounds_[0], b->second.tex.Get(),
-                                          layerBounds_[1], layerRot_, zeroPos);
+                    streamer_.SubmitFrame(refs, used, layerRot_, zeroPos);
                 }
             }
             km->ReleaseSync(0);
@@ -1265,10 +1333,15 @@ private:
     std::map<uint64_t, ComPtr<IDXGIKeyedMutex>> syncCache_;
     std::mutex d3dMu_;
     uint32_t nextIdx_[2] = {0, 0};
-    SharedTextureHandle_t lastLayer_[2] = {0, 0};
-    VRTextureBounds_t layerBounds_[2] = {};
+    static constexpr int kMaxLayers = 8;
+    struct LayerInfo {
+        SharedTextureHandle_t h[2] = {0, 0};
+        VRTextureBounds_t b[2] = {};
+    };
+    LayerInfo layers_[kMaxLayers];
     float layerRot_[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
     int layerCount_ = 0;
+    std::string lastLayerSig_;
     Streamer streamer_;
     std::function<bool(uint16_t, const uint8_t*, uint32_t)> sender_;
     std::atomic<uint32_t> videoSeq_{0};
