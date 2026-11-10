@@ -2,22 +2,37 @@
   "driver_opencardboard": {
     "serialNumber": "OPENCARDBOARD-001",
     "modelNumber": "OpenCardboard",
+
+    "phoneTransport": "usb",
     "phoneAddress": "172.20.10.1",
     "phonePort": 9000,
+
+    "displayFrequency": 90.0,
+    "renderWidth": 1280,
+    "renderHeight": 1280,
+    "fovTan": 1.2,
+    "ipd": 0.064,
+    "headHeight": 1.6,
     "windowX": 100,
     "windowY": 100,
     "windowWidth": 1280,
     "windowHeight": 640,
-    "renderWidth": 1280,
-    "renderHeight": 1280,
-    "displayFrequency": 60.0,
-    "ipd": 0.064,
-    "secondsFromVsyncToPhotons": 0.011,
-    "headHeight": 1.6,
-    "fovTan": 1.2,
+
     "streamEyeWidth": 1280,
     "streamEyeHeight": 1280,
-    "bitrateMbps": 40,
-    "ffmpegPath": "auto"
+    "bitrateMbps": 130,
+    "encoderPreset": "p5",
+    "ffmpegPath": "auto",
+
+    "secondsFromVsyncToPhotons": 0.011,
+    "predictionMs": 40,
+    "sendAngularVelocity": true,
+    "velocitySmoothingMs": 50,
+    "velocityDeadzoneLow": 0.08,
+    "velocityDeadzoneHigh": 0.40,
+
+    "gamepadBridge": true,
+    "padModel": "hidden",
+    "recenterButton": "lthumb"
   }
 }
