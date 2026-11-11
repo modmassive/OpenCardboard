@@ -15,6 +15,7 @@ targets:
         UISupportedInterfaceOrientations: [UIInterfaceOrientationLandscapeRight]
         UIRequiresFullScreen: true
         NSMotionUsageDescription: Used for head tracking.
+        NSCameraUsageDescription: Used for optional camera-based head position tracking.
         NSLocalNetworkUsageDescription: Used to connect to your PC for VR streaming.
         NSBonjourServices: [_opencardboard._tcp]
         CADisableMinimumFrameDurationOnPhone: true
