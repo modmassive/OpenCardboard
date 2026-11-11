@@ -5,6 +5,7 @@ import simd
 
 enum MsgType: UInt16 {
     case hello = 1, streamConfig = 2, pose = 3, videoFrame = 4, ping = 5, pong = 6, requestKeyframe = 7
+    case uiInput = 8, menuState = 9, pcInfo = 10
 }
 
 let protocolMagic: UInt32 = 0x3143564F
@@ -104,10 +105,33 @@ func parseVideoFrame(_ p: Data) -> (VideoFrameHeader, Data)? {
     return (h, p.subdata(in: 56..<p.count))
 }
 
-func encodePose(seq: UInt32, time: Double, rotation: simd_float3x3, position: SIMD3<Float> = .zero) -> Data {
+/// Pose message: 64 bytes as before, plus the gyro rate (rad/s, same space as the rotation) = 76 bytes.
+func encodePose(seq: UInt32, time: Double, rotation: simd_float3x3,
+                position: SIMD3<Float>, omega: SIMD3<Float>) -> Data {
     var w = ByteWriter()
     w.put(seq); w.put(UInt32(0)); w.put(time)
     for c in 0..<3 { for r in 0..<3 { w.put(rotation[c][r]) } }
     w.put(position.x); w.put(position.y); w.put(position.z)
+    w.put(omega.x); w.put(omega.y); w.put(omega.z)
     return w.data
+}
+
+/// Xbox-style controller state relayed from the PC while the headset menu is open.
+/// Button bits are the same as Windows XInput (0x0001 up, 0x0002 down, 0x0004 left, 0x0008 right,
+/// 0x0010 start, 0x0020 back, 0x0040 L3, 0x0080 R3, 0x0100 LB, 0x0200 RB, 0x1000 A, 0x2000 B, 0x4000 X, 0x8000 Y).
+struct PadState: Equatable {
+    var buttons: UInt32 = 0
+    var lx: Int16 = 0, ly: Int16 = 0, rx: Int16 = 0, ry: Int16 = 0
+    var lt: UInt8 = 0, rt: UInt8 = 0
+}
+
+func parsePadState(_ p: Data) -> PadState? {
+    guard p.count >= 16 else { return nil }
+    var r = ByteReader(p)
+    var s = PadState()
+    s.buttons = r.get(UInt32.self)
+    s.lx = r.get(Int16.self); s.ly = r.get(Int16.self)
+    s.rx = r.get(Int16.self); s.ry = r.get(Int16.self)
+    s.lt = r.get(UInt8.self); s.rt = r.get(UInt8.self)
+    return s
 }

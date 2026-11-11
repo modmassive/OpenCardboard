@@ -2,7 +2,7 @@ import Foundation
 import Network
 import simd
 
-/// The phone listens on a TCP port; the PC connects (Wi-Fi, USB hotspot, or a usbmuxd tunnel).
+/// The phone listens on a TCP port; the PC connects (USB tunnel, hotspot, or Wi-Fi).
 /// The listener restarts itself after failures and when the network changes.
 final class PCLink {
     private let queue = DispatchQueue(label: "pclink", qos: .userInteractive)
@@ -28,6 +28,9 @@ final class PCLink {
 
     var onStreamConfig: ((StreamConfig) -> Void)?
     var onVideoFrame: ((VideoFrameHeader, Data) -> Void)?
+    var onUiInput: ((PadState) -> Void)?
+    var onMenuState: ((Bool) -> Void)?
+    var onPcInfo: ((String) -> Void)?
 
     var isConnected: Bool { lock.lock(); defer { lock.unlock() }; return _connected }
     var stateText: String { lock.lock(); defer { lock.unlock() }; return _state }
@@ -101,7 +104,6 @@ final class PCLink {
             listener = l
 
             if useService {
-                // Browsing the same service type helps iOS show the Local Network prompt.
                 let b = NWBrowser(for: .bonjour(type: "_opencardboard._tcp", domain: nil), using: .tcp)
                 b.stateUpdateHandler = { _ in }
                 b.browseResultsChangedHandler = { _, _ in }
@@ -186,6 +188,12 @@ final class PCLink {
             if let cfg = StreamConfig(p) { onStreamConfig?(cfg) }
         case .videoFrame:
             if let (h, d) = parseVideoFrame(p) { onVideoFrame?(h, d) }
+        case .uiInput:
+            if let s = parsePadState(p) { onUiInput?(s) }
+        case .menuState:
+            if let f = p.first { onMenuState?(f != 0) }
+        case .pcInfo:
+            if let s = String(data: p, encoding: .utf8) { onPcInfo?(s) }
         case .ping:
             sendRaw(makeFrame(.pong, p))
         case .pong:
@@ -229,14 +237,20 @@ final class PCLink {
         }
     }
 
-    func sendPose(seq: UInt32, time: Double, rotation: simd_float3x3) {
+    func sendPose(seq: UInt32, time: Double, rotation: simd_float3x3, position: SIMD3<Float>, omega: SIMD3<Float>) {
         guard isConnected else { return }
-        sendRaw(makeFrame(.pose, encodePose(seq: seq, time: time, rotation: rotation)))
+        sendRaw(makeFrame(.pose, encodePose(seq: seq, time: time, rotation: rotation,
+                                            position: position, omega: omega)))
     }
 
     func sendRequestKeyframe() {
         guard isConnected else { return }
         sendRaw(makeFrame(.requestKeyframe, Data()))
+    }
+
+    func sendMenuState(_ open: Bool) {
+        guard isConnected else { return }
+        sendRaw(makeFrame(.menuState, Data([open ? 1 : 0, 0, 0, 0])))
     }
 }
 

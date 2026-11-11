@@ -1,12 +1,17 @@
 import CoreMotion
 import simd
 
-/// Reads phone orientation and returns a 3x3 matrix whose columns are the
-/// headset's right / up / back axes in a y-up render space.
+struct HeadSample {
+    var matrix: simd_float3x3      // columns: head right / up / back in a y-up render space
+    var omega: SIMD3<Float>        // gyro rate in the same space, rad/s
+}
+
 final class HeadTracker {
     private let mm = CMMotionManager()
     private var yawOffset: Float = 0
     private var wantsRecenter = true
+    private let lock = NSLock()
+    private var lastMatrix = matrix_identity_float3x3
 
     /// If turning your head moves the world the wrong way, flip this.
     var useTranspose = true
@@ -19,10 +24,17 @@ final class HeadTracker {
 
     func recenter() { wantsRecenter = true }
 
-    func viewMatrix() -> simd_float3x3 {
-        guard let m = mm.deviceMotion?.attitude.rotationMatrix else {
-            return matrix_identity_float3x3
+    /// Latest head forward direction (thread-safe, for the camera tracker's yaw alignment).
+    func forwardVector() -> SIMD3<Float> {
+        lock.lock(); defer { lock.unlock() }
+        return -lastMatrix.columns.2
+    }
+
+    func sample() -> HeadSample {
+        guard let dm = mm.deviceMotion else {
+            return HeadSample(matrix: matrix_identity_float3x3, omega: SIMD3<Float>(repeating: 0))
         }
+        let m = dm.attitude.rotationMatrix
         let transpose = useTranspose
 
         func toRender(_ d: SIMD3<Double>) -> SIMD3<Float> {
@@ -40,8 +52,7 @@ final class HeadTracker {
             return SIMD3(Float(r.x), Float(r.z), Float(-r.y))
         }
 
-        // Phone locked to landscapeRight: viewer right = device -Y,
-        // viewer up = device +X, viewer back = device +Z.
+        // Phone locked to landscapeRight: viewer right = device -Y, up = device +X, back = device +Z.
         let right = toRender(SIMD3(0, -1, 0))
         let up    = toRender(SIMD3(1, 0, 0))
         let back  = toRender(SIMD3(0, 0, 1))
@@ -55,6 +66,11 @@ final class HeadTracker {
         func rot(_ v: SIMD3<Float>) -> SIMD3<Float> {
             SIMD3(v.x * c + v.z * s, v.y, -v.x * s + v.z * c)
         }
-        return simd_float3x3(columns: (rot(right), rot(up), rot(back)))
+        let mat = simd_float3x3(columns: (rot(right), rot(up), rot(back)))
+        let rr = dm.rotationRate
+        let omega = rot(toRender(SIMD3(rr.x, rr.y, rr.z)))
+
+        lock.lock(); lastMatrix = mat; lock.unlock()
+        return HeadSample(matrix: mat, omega: omega)
     }
 }

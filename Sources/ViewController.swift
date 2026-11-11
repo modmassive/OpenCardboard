@@ -16,18 +16,11 @@ final class ViewController: UIViewController, UIGestureRecognizerDelegate {
         renderer = r
         mtk.delegate = r
 
-        let slot = SettingsStore.shared.slot
-        let s = SettingsStore.shared.load(slot)
-        r.setLens(s, notify: true)
-
-        panel = SettingsPanel(settings: s, slot: slot)
+        panel = SettingsPanel()
         panel.isHidden = true
         panel.translatesAutoresizingMaskIntoConstraints = false
-        panel.onChange = { [weak self] s, final in self?.renderer.setLens(s, notify: final) }
-        panel.onRecenter = { [weak self] in self?.renderer.recenter() }
-        panel.onForceTest = { [weak self] on in self?.renderer.forceTest = on }
+        panel.tabsProvider = { [weak self] in self?.renderer.menu.tabs ?? [] }
         panel.onClose = { [weak self] in self?.panel.hide() }
-        panel.statusProvider = { [weak self] in self?.renderer.statusText() ?? "" }
         view.addSubview(panel)
         NSLayoutConstraint.activate([
             panel.topAnchor.constraint(equalTo: view.topAnchor),
