@@ -192,7 +192,8 @@ std::string SettingS(const char* key, const char* def) {
 constexpr uint32_t kMagic = 0x3143564F;
 enum MsgType : uint16_t {
     MSG_HELLO = 1, MSG_STREAM_CONFIG = 2, MSG_POSE = 3, MSG_VIDEO = 4,
-    MSG_PING = 5, MSG_PONG = 6, MSG_KEYREQ = 7
+    MSG_PING = 5, MSG_PONG = 6, MSG_KEYREQ = 7,
+    MSG_UI_INPUT = 8, MSG_MENU_STATE = 9, MSG_PC_INFO = 10
 };
 
 // Rotation matrix (row r, column c) -> quaternion. Columns are the head's right/up/back axes.
@@ -734,6 +735,9 @@ public:
     }
 
     void SetRecenter(std::function<void()> f) { onRecenter_ = f; }
+    void SetMenuToggle(std::function<void()> f) { onMenuToggle_ = f; }
+    void SetUiSender(std::function<void(uint32_t, int16_t, int16_t, int16_t, int16_t, uint8_t, uint8_t)> f) { onUiInput_ = f; }
+    void SetMenuOpen(bool o) { menuOpen_ = o; }
 
     void SetHmdPose(const HmdQuaternion_t& q, const double pos[3], bool connected) {
         {
@@ -771,10 +775,18 @@ private:
         DWORD lSlots = 0xFFFFFFFFu;
         WORD lButtons = 0;
         BYTE lRt = 0;
+        auto comboStart = std::chrono::steady_clock::now();
+        bool comboHeld = false, comboFired = false;
+        WORD uB = 0xFFFF;
+        SHORT uLx = 0, uLy = 0, uRx = 0, uRy = 0;
+        BYTE uLt = 0, uRt = 0;
+        auto uLast = std::chrono::steady_clock::now();
         while (!stop_) {
             WORD b = 0;
-            BYTE rt = 0;
+            BYTE rt = 0, lt = 0;
+            SHORT lx = 0, ly = 0, rx = 0, ry = 0;
             DWORD slots = 0;
+            bool firstSlot = true;
             for (DWORD i = 0; i < 4; i++) {
                 XINPUT_STATE st;
                 ZeroMemory(&st, sizeof(st));
@@ -782,6 +794,12 @@ private:
                     slots |= (1u << i);
                     b |= st.Gamepad.wButtons;
                     if (st.Gamepad.bRightTrigger > rt) rt = st.Gamepad.bRightTrigger;
+                    if (st.Gamepad.bLeftTrigger > lt) lt = st.Gamepad.bLeftTrigger;
+                    if (firstSlot) {
+                        lx = st.Gamepad.sThumbLX; ly = st.Gamepad.sThumbLY;
+                        rx = st.Gamepad.sThumbRX; ry = st.Gamepad.sThumbRY;
+                        firstSlot = false;
+                    }
                 }
             }
             if (slots != lSlots) {
@@ -794,12 +812,42 @@ private:
                 Log("pad: XInput buttons 0x%04X, right trigger %u", (unsigned)b, (unsigned)rt);
             }
 
+            auto now = std::chrono::steady_clock::now();
+
+            // hold both bumpers for one second to open or close the headset menu
+            bool both = (b & XINPUT_GAMEPAD_LEFT_SHOULDER) && (b & XINPUT_GAMEPAD_RIGHT_SHOULDER);
+            if (both) {
+                if (!comboHeld) { comboHeld = true; comboFired = false; comboStart = now; }
+                else if (!comboFired && now - comboStart >= std::chrono::milliseconds(1000)) {
+                    comboFired = true;
+                    Log("pad: menu combo held");
+                    if (onMenuToggle_) onMenuToggle_();
+                }
+            } else {
+                comboHeld = false;
+                comboFired = false;
+            }
+
+            bool menuOpen = menuOpen_;
+            if (menuOpen && onUiInput_) {
+                // while the menu is open the controller belongs to the menu: relay it to the phone
+                bool changed = (b != uB) || lx != uLx || ly != uLy || rx != uRx || ry != uRy || lt != uLt || rt != uRt;
+                if (changed || now - uLast >= std::chrono::milliseconds(100)) {
+                    onUiInput_((uint32_t)b, (int16_t)lx, (int16_t)ly, (int16_t)rx, (int16_t)ry, (uint8_t)lt, (uint8_t)rt);
+                    uB = b; uLx = lx; uLy = ly; uRx = rx; uRy = ry; uLt = lt; uRt = rt;
+                    uLast = now;
+                }
+            } else {
+                uB = 0xFFFF;      // force a send as soon as the menu next opens
+            }
+
             float val = rt / 255.0f;
             bool trig = (b & XINPUT_GAMEPAD_A) || val > 0.5f;
             bool sys = (b & XINPUT_GAMEPAD_BACK) != 0;
             bool menu = (b & XINPUT_GAMEPAD_START) != 0;
             bool grip = (b & XINPUT_GAMEPAD_RIGHT_SHOULDER) != 0;
             if (trig && val < 0.5f) val = 1.0f;
+            if (menuOpen) { trig = sys = menu = grip = false; val = 0.0f; }     // nothing reaches SteamVR meanwhile
 
             bool rc = recenterMask_ != 0 && (b & recenterMask_) != 0;
             if (rc && !lRc && onRecenter_) { Log("pad: recenter button pressed"); onRecenter_(); }
@@ -816,6 +864,9 @@ private:
         }
     }
 
+    std::function<void()> onMenuToggle_;
+    std::function<void(uint32_t, int16_t, int16_t, int16_t, int16_t, uint8_t, uint8_t)> onUiInput_;
+    std::atomic<bool> menuOpen_{false};
     std::function<void()> onRecenter_;
     WORD recenterMask_ = XINPUT_GAMEPAD_LEFT_THUMB;
     std::atomic<uint32_t> id_{k_unTrackedDeviceIndexInvalid};
@@ -948,6 +999,8 @@ public:
     void SetConnected(bool c) {
         { std::lock_guard<std::mutex> g(mu_); connected_ = c; }
         if (!c) {
+            menuOpen_ = false;
+            if (pad_) pad_->SetMenuOpen(false);
             streamer_.Stop();
             {
                 std::lock_guard<std::mutex> g(mu_);
@@ -962,6 +1015,49 @@ public:
         Log("phone prefers frustum l=%.2f r=%.2f u=%.2f d=%.2f (not applied yet)", fl[0], fl[1], fl[2], fl[3]);
     }
     void SetSender(std::function<bool(uint16_t, const uint8_t*, uint32_t)> f) { sender_ = f; }
+    // ---- headset menu: the controller drives it while it is open
+    void OnMenuState(bool open) {
+        menuOpen_ = open;
+        if (pad_) pad_->SetMenuOpen(open);
+        Log("headset menu %s", open ? "opened" : "closed");
+    }
+    void ToggleMenu() {
+        if (!sender_ || !streamer_.Ready()) return;       // only when a phone is connected and streaming
+        bool want = !menuOpen_;
+        uint8_t p[4] = {(uint8_t)(want ? 1 : 0), 0, 0, 0};
+        if (sender_(MSG_MENU_STATE, p, 4)) {
+            menuOpen_ = want;
+            if (pad_) pad_->SetMenuOpen(want);
+            Log("headset menu %s (controller)", want ? "opened" : "closed");
+        }
+    }
+    void SendUiInput(uint32_t buttons, int16_t lx, int16_t ly, int16_t rx, int16_t ry, uint8_t lt, uint8_t rt) {
+        if (!sender_) return;
+        uint8_t p[16] = {0};
+        memcpy(p, &buttons, 4);
+        memcpy(p + 4, &lx, 2);
+        memcpy(p + 6, &ly, 2);
+        memcpy(p + 8, &rx, 2);
+        memcpy(p + 10, &ry, 2);
+        p[12] = lt;
+        p[13] = rt;
+        sender_(MSG_UI_INPUT, p, 16);
+    }
+    void SendPcInfo() {
+        if (!sender_) return;
+        float fov;
+        {
+            std::lock_guard<std::mutex> g(mu_);
+            fov = frust_[0][0];
+        }
+        char buf[300];
+        snprintf(buf, sizeof(buf),
+                 "Render=%dx%d per eye|Video=H.264 %d Mbps, preset %s|Display rate=%d Hz|Field of view=%.2f|Prediction=%d ms",
+                 streamEyeW_, streamEyeH_, mbps_, encoderPreset_.c_str(), (int)(freq_ + 0.5f), fov,
+                 (int)SettingF("predictionMs", 40.0f));
+        sender_(MSG_PC_INFO, (const uint8_t*)buf, (uint32_t)strlen(buf));
+    }
+
     bool HasD3D() const { return d3dReady_; }
     void SetPad(PadDevice* p) { pad_ = p; }
     void SetIpdMM(float mm) {
@@ -975,13 +1071,13 @@ public:
     }
     void OnPhoneReady() {
         if (!d3dReady_) { Log("no D3D device yet - will retry"); return; }
-        if (streamer_.Ready()) { SendStreamConfig(); return; }     // already running
+        if (streamer_.Ready()) { SendStreamConfig(); SendPcInfo(); return; }     // already running
         bool ok = streamer_.Start(dev_.Get(), ctx_.Get(), streamEyeW_, streamEyeH_, (int)(freq_ + 0.5f), mbps_,
                                   ffmpegPath_, encoderPreset_,
                                   [this](const float* rot, const float* pos, bool key, const uint8_t* au, size_t n) {
                                       SendVideo(rot, pos, key, au, n);
                                   });
-        if (ok) SendStreamConfig();
+        if (ok) { SendStreamConfig(); SendPcInfo(); }
     }
     void SendStreamConfig() {
         if (!sender_) return;
@@ -1015,13 +1111,15 @@ public:
         recenterRequested_ = true;
     }
 
-    void OnPose(const float rot[9], const float pos[3]) {
+    void OnPose(const float rot[9], const float pos[3], const float* omega) {
         float m[3][3];
         for (int c = 0; c < 3; c++)
             for (int r = 0; r < 3; r++) m[r][c] = rot[c * 3 + r];   // column-major on the wire
         HmdQuaternion_t qRaw = QuatFromMatrix(m);
 
         HmdQuaternion_t q;
+        double pr[3] = {0, 0, 0};
+        double wv[3] = {0, 0, 0};
         bool yawChanged = false;
         {
             std::lock_guard<std::mutex> g(mu_);
@@ -1055,6 +1153,10 @@ public:
                 }
             }
             q = QMul(yawQ_, qRaw);
+            RotateVec(yawQ_, pos[0], pos[1], pos[2], pr);              // position follows the same yaw
+            if (yawChanged) for (int i = 0; i < 3; i++) posOffset_[i] = pr[i];   // recentre zeroes position too
+            for (int i = 0; i < 3; i++) pr[i] -= posOffset_[i];
+            if (omega) RotateVec(yawQ_, omega[0], omega[1], omega[2], wv);
         }
 
         auto now = std::chrono::steady_clock::now();
@@ -1063,12 +1165,17 @@ public:
         if (havePrev_ && !yawChanged) {
             dt = std::chrono::duration<double>(now - prevT_).count();
             if (dt > 0.001 && dt < 0.1) {
-                HmdQuaternion_t d = QMul(q, QConj(prevQ_));      // world-frame rotation since the last sample
-                if (d.w < 0) { d.w = -d.w; d.x = -d.x; d.y = -d.y; d.z = -d.z; }
-                double sn = std::sqrt(d.x * d.x + d.y * d.y + d.z * d.z);
-                if (sn > 1e-9) {
-                    double k = 2.0 * std::atan2(sn, d.w) / sn / dt;
-                    w3[0] = d.x * k; w3[1] = d.y * k; w3[2] = d.z * k;
+                if (omega) {
+                    // the phone's gyro rate: much cleaner than differencing noisy orientations
+                    for (int i = 0; i < 3; i++) w3[i] = wv[i];
+                } else {
+                    HmdQuaternion_t d = QMul(q, QConj(prevQ_));
+                    if (d.w < 0) { d.w = -d.w; d.x = -d.x; d.y = -d.y; d.z = -d.z; }
+                    double sn = std::sqrt(d.x * d.x + d.y * d.y + d.z * d.z);
+                    if (sn > 1e-9) {
+                        double k = 2.0 * std::atan2(sn, d.w) / sn / dt;
+                        w3[0] = d.x * k; w3[1] = d.y * k; w3[2] = d.z * k;
+                    }
                 }
             } else {
                 dt = 0.0;
@@ -1080,7 +1187,7 @@ public:
         {
             std::lock_guard<std::mutex> g(mu_);
             q_ = q;
-            for (int i = 0; i < 3; i++) pos_[i] = pos[i];
+            for (int i = 0; i < 3; i++) pos_[i] = pr[i];
             if (dt > 0.0) {
                 double a = dt / (velSmoothMs_ / 1000.0 + dt);     // time-based smoothing
                 for (int i = 0; i < 3; i++) angVel_[i] += a * (w3[i] - angVel_[i]);
@@ -1089,7 +1196,7 @@ public:
             }
         }
         if (pad_) {
-            double pp[3] = {pos[0], headHeight_ + pos[1], pos[2]};
+            double pp[3] = {pr[0], headHeight_ + pr[1], pr[2]};
             pad_->SetHmdPose(q, pp, true);
         }
         PushPose();
@@ -1351,6 +1458,8 @@ private:
     std::chrono::steady_clock::time_point prevT_;
     bool havePrev_ = false;
     double angVel_[3] = {0, 0, 0};
+    std::atomic<bool> menuOpen_{false};
+    double posOffset_[3] = {0, 0, 0};
     float velSmoothMs_ = 50.0f, velDeadLow_ = 0.08f, velDeadHigh_ = 0.40f;
     bool sendAngVel_ = true;
     HmdQuaternion_t yawQ_ = {1, 0, 0, 0};
@@ -1581,8 +1690,13 @@ private:
                 float rot[9], pos[3];
                 memcpy(rot, payload.data() + 16, 36);
                 memcpy(pos, payload.data() + 52, 12);
-                hmd_->OnPose(rot, pos);
+                float om[3] = {0, 0, 0};
+                bool haveOm = len >= 76;
+                if (haveOm) memcpy(om, payload.data() + 64, 12);
+                hmd_->OnPose(rot, pos, haveOm ? om : nullptr);
                 poses++;
+            } else if (type == MSG_MENU_STATE && len >= 1) {
+                hmd_->OnMenuState(payload[0] != 0);
             } else if (type == MSG_PING) {
                 if (!SendMsg(s, MSG_PONG, payload.data(), len)) return;
             }
@@ -1653,6 +1767,10 @@ public:
             Log("gaze pointer added: %d", added ? 1 : 0);
             hmd_->SetPad(pad_);
             pad_->SetRecenter([this] { if (hmd_) hmd_->RequestRecenter(); });
+            pad_->SetMenuToggle([this] { if (hmd_) hmd_->ToggleMenu(); });
+            pad_->SetUiSender([this](uint32_t b, int16_t lx, int16_t ly, int16_t rx, int16_t ry, uint8_t lt, uint8_t rt) {
+                if (hmd_) hmd_->SendUiInput(b, lx, ly, rx, ry, lt, rt);
+            });
         }
         hmd_->SetSender([this](uint16_t t, const uint8_t* p, uint32_t n) { return net_.Send(t, p, n); });
         net_.SetTransport(SettingS("phoneTransport", "auto"));
